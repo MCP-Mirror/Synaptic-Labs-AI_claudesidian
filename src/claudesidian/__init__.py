@@ -1,5 +1,3 @@
-# File: claudesidian/__init__.py
-
 """
 Claudesidian: An MCP server for integrating Obsidian with Claude.
 Provides vault management, web scraping, and memory capabilities.
@@ -8,8 +6,8 @@ Provides vault management, web scraping, and memory capabilities.
 from pathlib import Path
 from typing import Optional
 
-from .server import ClaudesidianServer
-from .config import Config
+from claudesidian.server import ClaudesidianServer
+from claudesidian.config import Config
 
 __version__ = "0.1.0"
 
@@ -17,18 +15,7 @@ def create_server(
     vault_path: Optional[str] = None,
     config_path: Optional[str] = None
 ) -> ClaudesidianServer:
-    """
-    Create and configure a Claudesidian server instance.
-    
-    Args:
-        vault_path: Optional path to Obsidian vault. If not provided,
-                   will use config file or environment variable.
-        config_path: Optional path to config file. If not provided,
-                    will look in default locations.
-    
-    Returns:
-        Configured ClaudesidianServer instance
-    """
+    """Create and configure a Claudesidian server instance."""
     config = Config.load(config_path)
     
     if vault_path:

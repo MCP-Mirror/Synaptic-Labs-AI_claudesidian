@@ -13,8 +13,8 @@ import logging
 import yaml
 from copy import deepcopy
 
-from . import Frontmatter, InvalidFrontmatterError
-from ..utils.path_resolver import PathResolver
+from .types import Frontmatter, InvalidFrontmatterError
+from ..utils.path_resolver import PathResolver  # Fix the import path
 
 logger = logging.getLogger(__name__)
 
@@ -48,17 +48,10 @@ class FrontmatterManager:
         Returns:
             Frontmatter object or None if no frontmatter
         """
-        fm_match = re.match(r"^---\n(.*?)\n---", content, re.DOTALL)
-        if not fm_match:
+        fm_block = FrontmatterParser.parse(content)
+        if not fm_block.data:
             return None
-            
-        try:
-            data = yaml.safe_load(fm_match.group(1))
-            if not isinstance(data, dict):
-                raise InvalidFrontmatterError("Frontmatter must be a dictionary")
-            return Frontmatter(data)
-        except yaml.YAMLError as e:
-            raise InvalidFrontmatterError(f"Invalid YAML in frontmatter: {e}")
+        return Frontmatter(fm_block.data)
 
     async def generate(self, template_name: Optional[str] = None,
                       **kwargs) -> Frontmatter:
@@ -267,3 +260,177 @@ class FrontmatterManager:
             
         # Update cache
         self._template_cache[name] = frontmatter
+
+import re
+import yaml
+import logging
+from typing import Dict, Any, Optional, List, Tuple
+from dataclasses import dataclass
+
+logger = logging.getLogger(__name__)
+
+@dataclass
+class FrontmatterBlock:
+    """Represents parsed frontmatter with original text."""
+    raw_text: str
+    data: Dict[str, Any]
+    errors: List[str]
+
+class FrontmatterPreprocessor:
+    """Handles preprocessing of frontmatter before YAML parsing."""
+    
+    # Updated patterns to handle nested brackets and quotes
+    PATTERNS = [
+        # Handle extra closing brackets and quotes in wiki-links
+        (r'\[\[(.*?)\]\](\]*)("*)', r'"[[\1]]"'),  # Convert [[link]]" or [[link]]] to "[[link]]"
+        
+        # Handle regular wiki-links
+        (r'\[\[(.*?)\]\]', r'"[[\1]]"'),  # Basic wiki-link quoting
+        
+        # Clean up other syntax
+        (r'::+', ':'),  # Multiple colons to single
+        (r'(\s*:\s*$)', ': ""'),  # Empty values
+        (r'(\w+:.*?):', r'\1\\:'),  # Escape colons in values
+        
+        # Quote values that need it
+        (r'(\s*[^\s]+):\s*([^"\'].+)$', r'\1: "\2"'),  # Quote unquoted values
+    ]
+
+    @classmethod
+    def preprocess(cls, text: str) -> str:
+        """Apply all preprocessing rules."""
+        lines = []
+        in_list = False
+        list_indent = 0
+
+        for line in text.splitlines():
+            processed = line
+            
+            # Handle list items
+            if line.lstrip().startswith('- '):
+                in_list = True
+                if not list_indent:
+                    list_indent = len(line) - len(line.lstrip())
+                    
+                # Clean up list item values
+                processed = re.sub(r'^(\s*-\s*)(.+?)(\]*)("*)$', r'\1"\2"', processed)
+                lines.append(processed)
+                continue
+
+            # Apply patterns
+            for pattern, repl in cls.PATTERNS:
+                processed = re.sub(pattern, repl, processed)
+
+            lines.append(processed)
+
+        return '\n'.join(lines)
+
+class FrontmatterParser:
+    """Main frontmatter parsing system."""
+    
+    @staticmethod
+    def extract_frontmatter(content: str) -> Optional[Tuple[str, str]]:
+        """Extract frontmatter block from content."""
+        pattern = r'^---\s*\n(.*?)\n---\s*\n'
+        match = re.match(pattern, content, re.DOTALL)
+        if not match:
+            return None
+        return match.group(1), content[match.end():]
+    
+    @classmethod
+    def parse(cls, content: str, strict: bool = False) -> FrontmatterBlock:
+        """
+        Parse frontmatter with fallback strategies.
+        
+        Args:
+            content: Full document content
+            strict: Whether to raise errors or collect them
+            
+        Returns:
+            FrontmatterBlock with parsed data and any errors
+        """
+        errors = []
+        extracted = cls.extract_frontmatter(content)
+        
+        if not extracted:
+            return FrontmatterBlock("", {}, ["No frontmatter found"])
+            
+        frontmatter_text, _ = extracted
+        original_text = frontmatter_text
+        
+        # Try increasingly aggressive parsing strategies
+        strategies = [
+            ('standard', lambda t: yaml.safe_load(t)),
+            ('preprocessed', lambda t: yaml.safe_load(FrontmatterPreprocessor.preprocess(t))),
+            ('quoted', lambda t: yaml.safe_load(cls._quote_all_values(t))),
+            ('basic', cls._parse_basic_pairs)
+        ]
+        
+        data = {}
+        for name, strategy in strategies:
+            try:
+                data = strategy(frontmatter_text)
+                if isinstance(data, dict):
+                    return FrontmatterBlock(original_text, data, errors)
+            except Exception as e:
+                errors.append(f"Strategy {name} failed: {str(e)}")
+                continue
+
+        # After trying all strategies, handle the failure
+        if strict:
+            raise ValueError("All parsing strategies failed")
+        else:
+            logger.warning(f"All parsing strategies failed: {errors}")
+            return FrontmatterBlock(original_text, {}, errors)
+
+    # ...existing code...
+    
+    @staticmethod
+    def _quote_all_values(text: str) -> str:
+        """Quote all values in YAML."""
+        lines = []
+        for line in text.splitlines():
+            if ':' in line:
+                key, value = line.split(':', 1)
+                value = value.strip()
+                if value and not (value.startswith('"') or value.startswith("'")):
+                    line = f'{key}: "{value}"'
+            lines.append(line)
+        return '\n'.join(lines)
+    
+    @staticmethod
+    def _parse_basic_pairs(text: str) -> Dict[str, Any]:
+        """Parse as simple key-value pairs."""
+        data = {}
+        current_key = None
+        current_value = []
+        
+        for line in text.splitlines():
+            line = line.strip()
+            if not line:
+                continue
+                
+            # New key-value pair
+            if ':' in line and not line.startswith('-'):
+                if current_key and current_value:
+                    data[current_key] = '\n'.join(current_value).strip()
+                key, value = line.split(':', 1)
+                current_key = key.strip()
+                current_value = [value.strip()]
+            # List item
+            elif line.startswith('-'):
+                if current_key:
+                    if not isinstance(data.get(current_key), list):
+                        data[current_key] = []
+                    data[current_key].append(line[1:].trip())
+            # Continuation of previous value
+            elif current_key:
+                current_value.append(line)
+                
+        # Add final key-value pair
+        if current_key and current_value:
+            data[current_key] = '\n'.join(current_value).strip()
+            
+        return data
+            
+        return data

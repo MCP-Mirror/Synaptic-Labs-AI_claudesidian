@@ -12,12 +12,159 @@ from datetime import datetime
 import logging
 import yaml
 
-from . import (
-    NoteMetadata, ObsidianLink, LinkType, Tag, Heading, 
-    Frontmatter, NoteNotFoundError, InvalidFrontmatterError
+from .types import (
+    Frontmatter, 
+    InvalidFrontmatterError,
+    NoteMetadata, 
+    ObsidianLink, 
+    LinkType, 
+    Tag, 
+    Heading,
+    NoteNotFoundError  # Added import
 )
+from .frontmatter import FrontmatterParser
 
 logger = logging.getLogger(__name__)
+
+class SafeTemplateLoader(yaml.SafeLoader):
+    """Custom YAML loader that handles both templates and markdown content safely."""
+    
+    @staticmethod
+    def preserve_markdown(value):
+        """Preserve markdown content in YAML values."""
+        if isinstance(value, str):
+            # Handle Obsidian-style links [[...]]
+            if '[[' in value and ']]' in value:
+                return str(value)
+            # Handle markdown list items
+            if value.startswith('- '):
+                return str(value)
+        return value
+
+    def construct_scalar(self, node):
+        """Override scalar construction to preserve markdown."""
+        value = super().construct_scalar(node)
+        return self.preserve_markdown(value)
+
+class NoteFrontmatter:
+    """Handle note frontmatter parsing with template and markdown support."""
+
+    @staticmethod
+    def _escape_quotes(text: str) -> str:
+        """Handle nested quotes in YAML values."""
+        # If text contains quotes, wrap it in block scalar
+        if '"' in text or "'" in text:
+            # Use literal block scalar for preserving quotes
+            escaped = text.replace('\n', '\n  ')  # Indent content
+            return f'|-\n  {escaped}'
+        return f'"{text}"'
+
+    @staticmethod
+    def _preprocess_frontmatter(text: str) -> str:
+        """Pre-process frontmatter text to handle complex values."""
+        lines = text.split('\n')
+        processed_lines = []
+        in_list = False
+        list_indent = 0
+        current_key = None
+
+        for line in lines:
+            stripped = line.lstrip()
+            if not stripped:
+                processed_lines.append(line)
+                continue
+
+            # Handle list items
+            if stripped.startswith('- '):
+                in_list = True
+                if not list_indent:
+                    list_indent = len(line) - len(stripped)
+                processed_lines.append(line)
+                continue
+
+            if in_list and len(line) - len(line.lstrip()) >= list_indent:
+                processed_lines.append(line)
+                continue
+
+            in_list = False
+            list_indent = 0
+
+            # Handle key-value pairs
+            if ':' in stripped and not stripped.startswith('-'):
+                key, value = [x.strip() for x in stripped.split(':', 1)]
+                current_key = key
+                indent = len(line) - len(stripped)
+
+                # Handle empty values
+                if not value:
+                    processed_lines.append(line)
+                    continue
+
+                # Handle values with special characters
+                if any(c in value for c in '"\':#,[]{}'):
+                    escaped_value = NoteFrontmatter._escape_quotes(value)
+                    if '\n' in escaped_value:
+                        # Multiline value
+                        processed_lines.append(f"{' ' * indent}{key}:")
+                        for v_line in escaped_value.split('\n'):
+                            processed_lines.append(f"{' ' * (indent + 2)}{v_line}")
+                    else:
+                        processed_lines.append(f"{' ' * indent}{key}: {escaped_value}")
+                else:
+                    processed_lines.append(line)
+            else:
+                # Handle continuation of previous value
+                if current_key and not stripped.startswith('-'):
+                    indent = len(line) - len(stripped)
+                    escaped_value = NoteFrontmatter._escape_quotes(stripped)
+                    processed_lines[-1] = f"{' ' * indent}{current_key}: {escaped_value}"
+                else:
+                    processed_lines.append(line)
+
+        return '\n'.join(processed_lines)
+
+    @staticmethod
+    def parse_frontmatter(content: str) -> Optional[Dict[str, Any]]:
+        """Parse frontmatter while handling complex values."""
+        try:
+            match = re.match(r'^---\s*\n(.*?)\n---\s*\n', content, re.DOTALL)
+            if not match:
+                return None
+
+            frontmatter_text = match.group(1)
+            processed_text = NoteFrontmatter._preprocess_frontmatter(frontmatter_text)
+
+            # Use safe_load to parse the processed YAML
+            frontmatter = yaml.safe_load(processed_text)
+
+            if not isinstance(frontmatter, dict):
+                return {}
+
+            # Clean and normalize values
+            cleaned = {}
+            for k, v in frontmatter.items():
+                if isinstance(v, str):
+                    # Preserve newlines in block scalars
+                    if '\n' in v:
+                        cleaned[k] = v
+                    else:
+                        cleaned[k] = v.strip()
+                elif isinstance(v, list):
+                    # Handle list values
+                    cleaned[k] = [
+                        item.strip() if isinstance(item, str) else item
+                        for item in v
+                    ]
+                else:
+                    cleaned[k] = v
+
+            return cleaned
+
+        except Exception as e:
+            logger.warning(f"Error parsing frontmatter: {e}")
+            return {}
+
+    # ...existing code...
 
 class NoteManager:
     """
@@ -150,26 +297,19 @@ class NoteManager:
             f.write(new_content)
 
     async def parse_note(self, content: str, path: Path) -> NoteMetadata:
-        """
-        Parse note content to extract metadata.
-        
-        Args:
-            content: Note content
-            path: Note path
-            
-        Returns:
-            NoteMetadata object
-        """
-        # Extract frontmatter
+        """Parse note content to extract metadata."""
+        # Extract frontmatter using new parser
         frontmatter = {}
-        fm_match = self.FRONTMATTER_RE.match(content)
-        if fm_match:
-            try:
-                frontmatter = yaml.safe_load(fm_match.group(1))
-                content = content[fm_match.end():]
-            except yaml.YAMLError as e:
-                logger.warning(f"Invalid frontmatter in {path}: {e}")
-                
+        try:
+            result = FrontmatterParser.parse(content)
+            if result.errors:
+                logger.debug(f"Frontmatter parsing issues in {path}: {result.errors}")
+            frontmatter = result.data
+            content = content[len(result.raw_text):] if result.raw_text else content
+        except Exception as e:
+            logger.warning(f"Failed to parse frontmatter in {path}: {e}")
+            frontmatter = {}  # Fallback to empty frontmatter
+
         # Extract links
         links = []
         

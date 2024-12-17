@@ -11,6 +11,7 @@ from datetime import datetime
 import logging
 from pathlib import Path
 
+from ..core.notes import NoteFrontmatter  # Add this import
 from .graph import KnowledgeGraph
 from .relationships import RelationshipManager
 from .decay import DecaySystem
@@ -40,20 +41,27 @@ class MemoryManager:
     Manages interactions between components and handles memory operations.
     """
     
-    def __init__(self, vault_manager: VaultManager):
+    def __init__(self, 
+                 vault_manager: VaultManager,
+                 graph: Optional[KnowledgeGraph] = None,
+                 relationships: Optional[RelationshipManager] = None,
+                 decay: Optional[DecaySystem] = None):
         """
         Initialize the memory system.
         
         Args:
             vault_manager: VaultManager instance
+            graph: Optional KnowledgeGraph instance
+            relationships: Optional RelationshipManager instance
+            decay: Optional DecaySystem instance
         """
         self.vault = vault_manager
         self.notes = NoteManager(vault_manager)
         
         # Initialize components
-        self.graph = KnowledgeGraph()
-        self.relationships = RelationshipManager()
-        self.decay = DecaySystem()
+        self.graph = graph or KnowledgeGraph()
+        self.relationships = relationships or RelationshipManager(self.graph)
+        self.decay = decay or DecaySystem(self.graph)
         self.moc = MOCGenerator(self.graph)
         
         # State tracking
@@ -65,6 +73,19 @@ class MemoryManager:
         self.vault.on('note_modified', self._handle_note_modified)
         self.vault.on('note_created', self._handle_note_created)
         self.vault.on('note_deleted', self._handle_note_deleted)
+        
+        # Add caching
+        self._cache = {}
+        self._cache_ttl = 300  # 5 minutes
+        
+        # Connection pool
+        self._pool = None
+        self._pool_size = 10
+
+    async def _init_pool(self):
+        """Initialize connection pool."""
+        if not self._pool:
+            self._pool = await self.graph.create_pool(self._pool_size)
 
     async def initialize(self):
         """Initialize the memory system and start background processing."""
@@ -138,6 +159,15 @@ class MemoryManager:
         except Exception as e:
             logger.error(f"Error processing input: {e}")
             return result
+
+    async def process_input_batch(self, inputs: List[str]) -> List[Dict[str, Any]]:
+        """Process multiple inputs in batch."""
+        results = []
+        async with self._pool.acquire() as conn:
+            for input_text in inputs:
+                result = await self._process_single_input(conn, input_text)
+                results.append(result)
+        return results
 
     async def query_memory(self, query: str, context: Optional[Dict] = None,
                          limit: int = 5) -> Dict[str, Any]:
@@ -292,27 +322,49 @@ class MemoryManager:
     async def _build_initial_graph(self):
         """Build initial knowledge graph from vault contents."""
         try:
-            # Get all notes
             notes = await self.vault.get_all_notes()
             
-            # Process each note
             for note_path in notes:
-                content, metadata = await self.notes.get_note(note_path)
-                
-                # Add to graph
-                await self.graph.add_node(
-                    str(note_path),
-                    content=content,
-                    metadata=metadata
-                )
-                
-            # Build relationships
-            await self.relationships.build_initial_connections()
-            
-            logger.info(f"Built initial graph with {len(notes)} notes")
-            
+                try:
+                    content = await self.vault.get_note(note_path)
+                    # Convert note path to string for hashing
+                    node_id = str(note_path)
+                    
+                    # Add node with sanitized metadata as attributes dict
+                    metadata = self._sanitize_metadata(note_path, content)
+                    self.graph.add_node(node_id, attributes=metadata)
+                    
+                except Exception as e:
+                    logger.error(f"Error processing note {note_path}: {e}")
+                    continue
+                    
         except Exception as e:
             logger.error(f"Error building initial graph: {e}")
+            raise
+
+    def _sanitize_metadata(self, path: Path, content: str) -> Dict[str, Any]:
+        """Create safe metadata dictionary for graph nodes."""
+        metadata = {
+            'path': str(path),
+            'name': path.name,
+            'type': 'note',
+            'content': content
+        }
+        
+        try:
+            # Extract and convert frontmatter
+            frontmatter = NoteFrontmatter.parse_frontmatter(content)
+            if frontmatter:
+                # Convert all values to strings for safety
+                safe_frontmatter = {
+                    f"fm_{k}": str(v) if v is not None else ''
+                    for k, v in frontmatter.items()
+                }
+                metadata.update(safe_frontmatter)
+        except Exception as e:
+            logger.warning(f"Error parsing frontmatter for {path}: {e}")
+            
+        return metadata
 
     async def _background_processor(self):
         """Background task for processing queue items."""

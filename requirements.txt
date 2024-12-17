@@ -1,3 +1,22 @@
 questionary>=2.0.0
-requests
-python-dotenv
+mcp>=0.1.0          # Model Context Protocol SDK
+requests            # HTTP requests library
+python-dotenv       # Environment variable management
+pyyaml             # YAML handling for frontmatter
+httpx              # Async HTTP client
+asyncio
+html2text
+aiofiles
+trafilatura
+readability
+pyppeteer
+fuzzywuzzy
+watchdog            # File system monitoring
+scikit-learn       # Machine learning utilities for text processing
+numpy              # Required by scikit-learn
+uvicorn            # ASGI server
+
+# Development dependencies (optional)
+mypy               # Static type checking
+black              # Code formatting
+flake8             # Code linting

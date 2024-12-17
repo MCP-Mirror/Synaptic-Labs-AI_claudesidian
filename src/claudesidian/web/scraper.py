@@ -16,6 +16,11 @@ from datetime import datetime
 import re
 import aiohttp
 from urllib.parse import urljoin, urlparse
+from pyppeteer import launch
+from pyppeteer.errors import TimeoutError
+import sys
+import os
+import atexit
 
 from . import (
     WebContent, ScrapingConfig, ImageHandling, ContentPriority,
@@ -72,16 +77,39 @@ class WebScraper:
             '.author',
             '.byline',
             'meta[name="author"]'
-        ]
+        ],
+        'markdown': ['.markdown-preview-view', '.markdown-source-view'],
+        'frontmatter': ['.frontmatter-container'],
+        'internal_links': ['.internal-link'],
+        'tags': ['.tag']
     }
 
-    def __init__(self, 
+    def __init__(self,
                  config: Optional[ScrapingConfig] = None,
                  vault_path: Optional[Path] = None):
         """Initialize the web scraper."""
         self.config = {**self.DEFAULT_CONFIG, **(config or {})}
         self.vault_path = vault_path
-        self._setup_puppeteer()
+        self.browser = None  # Initialize in setup()
+        self._cleanup_lock = asyncio.Lock()
+        self._cleanup_complete = asyncio.Event()
+        self._shutdown_lock = asyncio.Lock()
+        self._is_shutdown = False
+        atexit.register(self._sync_cleanup)
+        
+    def _sync_cleanup(self):
+        """Synchronous cleanup for atexit."""
+        if self.browser and hasattr(self.browser, 'process'):
+            try:
+                # Force kill the browser process if still running
+                self.browser.process.kill()
+            except:
+                pass
+
+    async def setup(self):
+        """Async initialization."""
+        if not self.browser:
+            await self._setup_puppeteer()
 
     async def normalize_url(self, url: str) -> str:
         """
@@ -223,19 +251,35 @@ class WebScraper:
             if self.config.get('screenshot_enabled'):
                 content.screenshots = await self._take_screenshots(page)
                 
+            # Add Obsidian-specific metadata extraction
+            content.metadata.tags = await self._extract_tags(page)
+            content.metadata.internal_links = await self._extract_internal_links(page)
+            
             # Clean up
             await page.close()
             
             return content
             
         except Exception as e:
-            if isinstance(e, puppeteer.errors.TimeoutError):
+            if isinstance(e, TimeoutError):
                 raise ScrapingError("Page load timeout", normalized_url)
             raise
 
     async def _setup_puppeteer(self):
-        """Initialize Puppeteer with stealth settings."""
-        self.browser = await puppeteer.launch({
+        """Initialize Pyppeteer with stealth settings."""
+        # Try to find installed Chrome/Edge
+        if sys.platform == 'win32':
+            chrome_paths = [
+                'C:/Program Files/Google/Chrome/Application/chrome.exe',
+                'C:/Program Files (x86)/Google/Chrome/Application/chrome.exe',
+                'C:/Program Files (x86)/Microsoft/Edge/Application/msedge.exe',
+                'C:/Program Files/Microsoft/Edge/Application/msedge.exe',
+            ]
+            executable_path = next((path for path in chrome_paths if os.path.exists(path)), None)
+        else:
+            executable_path = None
+
+        launch_options = {
             'headless': True,
             'args': [
                 '--no-sandbox',
@@ -249,8 +293,21 @@ class WebScraper:
                 '--window-size=1920,1080',
                 '--ignore-certificate-errors',
                 '--disable-blink-features=AutomationControlled',
-            ]
-        })
+            ],
+            'ignoreHTTPSErrors': True,
+            'defaultViewport': self.config['viewport']
+        }
+
+        if executable_path:
+            launch_options['executablePath'] = executable_path
+            launch_options['downloadChromium'] = False
+
+        try:
+            self.browser = await launch(launch_options)
+            logger.info("Browser initialized successfully")
+        except Exception as e:
+            logger.error(f"Failed to launch browser: {e}")
+            raise
 
     async def _setup_page(self, page) -> None:
         """Configure page with anti-detection measures."""
@@ -333,25 +390,29 @@ class WebScraper:
         """Simulate human-like scrolling behavior."""
         await page.evaluate('''
             () => {
-                const scroll = () => {
-                    const height = document.body.scrollHeight;
-                    const duration = 10000; // 10 seconds
-                    const start = performance.now();
-                    
-                    const step = (timestamp) => {
-                        const elapsed = timestamp - start;
-                        const progress = Math.min(elapsed / duration, 1);
+                return new Promise((resolve) => {
+                    const scroll = () => {
+                        const height = document.body.scrollHeight;
+                        const duration = 10000; // 10 seconds
+                        const start = performance.now();
                         
-                        window.scrollTo(0, height * progress);
+                        const step = (timestamp) => {
+                            const elapsed = timestamp - start;
+                            const progress = Math.min(elapsed / duration, 1);
+                            
+                            window.scrollTo(0, height * progress);
+                            
+                            if (progress < 1) {
+                                requestAnimationFrame(step);
+                            } else {
+                                resolve();
+                            }
+                        };
                         
-                        if (progress < 1) {
-                            requestAnimationFrame(step);
-                        }
+                        requestAnimationFrame(step);
                     };
-                    
-                    requestAnimationFrame(step);
-                };
-                scroll();
+                    scroll();
+                });
             }
         ''')
         
@@ -380,7 +441,58 @@ class WebScraper:
             raise ScrapingError("Cloudflare protection detected", page.url)
 
     async def close(self) -> None:
-        """Clean up browser instance."""
-        if self.browser:
-            await self.browser.close()
-            self.browser = None
+        """Safely close the browser."""
+        async with self._shutdown_lock:
+            if self._is_shutdown:
+                return
+                
+            try:
+                if self.browser:
+                    if hasattr(self.browser, 'process') and self.browser.process:
+                        try:
+                            # Try graceful shutdown with timeout
+                            await asyncio.wait_for(self.browser.close(), timeout=5.0)
+                        except asyncio.TimeoutError:
+                            # Force kill if graceful shutdown fails
+                            self.browser.process.kill()
+                        except Exception as e:
+                            logger.error(f"Error during browser close: {e}")
+                    self.browser = None
+            finally:
+                self._is_shutdown = True
+                logger.info("WebScraper shutdown complete")
+
+    def __del__(self):
+        """Ensure browser process is killed on garbage collection."""
+        if hasattr(self, 'browser') and self.browser:
+            if hasattr(self.browser, 'process') and self.browser.process:
+                try:
+                    self.browser.process.kill()
+                except:
+                    pass
+
+    async def _extract_tags(self, page) -> List[str]:
+        """Extract Obsidian tags from content."""
+        tags = []
+        elements = await page.querySelectorAll('.tag')
+        for element in elements:
+            tag_text = await page.evaluate('(element) => element.textContent', element)
+            tags.append(tag_text)
+        return tags
+
+    async def _extract_internal_links(self, page) -> List[str]:
+        """Extract Obsidian internal links."""
+        links = []
+        elements = await page.querySelectorAll('.internal-link')
+        for element in elements:
+            href = await page.evaluate('(element) => element.getAttribute("href")', element)
+            if href:
+                links.append(href)
+        return links
+
+    async def __aenter__(self):
+        await self.setup()
+        return self
+
+    async def __aexit__(self, exc_type, exc_val, exc_tb):
+        await self.close()

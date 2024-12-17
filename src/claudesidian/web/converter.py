@@ -32,7 +32,8 @@ class ContentConverter:
     
     def __init__(self, vault_path: Path,
                  image_handling: ImageHandling = ImageHandling.DOWNLOAD,
-                 attachment_folder: str = "attachments/web"):
+                 attachment_folder: str = "attachments/web",
+                 obsidian_config: Optional[Dict] = None):
         """
         Initialize converter with configuration.
         
@@ -40,10 +41,12 @@ class ContentConverter:
             vault_path: Path to Obsidian vault
             image_handling: How to handle images
             attachment_folder: Where to store downloaded files
+            obsidian_config: Optional Obsidian-specific configuration
         """
         self.vault_path = Path(vault_path)
         self.image_handling = image_handling
         self.attachment_folder = attachment_folder
+        self.obsidian_config = obsidian_config or {}
         
         # Configure HTML to Markdown converter
         self.h2t = html2text.HTML2Text()
@@ -113,7 +116,7 @@ class ContentConverter:
         return Path(f"Web/{date}/{safe_title}.md")
 
     async def _generate_frontmatter(self, content: WebContent) -> Dict[str, Any]:
-        """Generate frontmatter for the note."""
+        """Generate frontmatter with Obsidian-specific fields."""
         frontmatter = {
             'title': content.metadata.title if content.metadata else None,
             'url': content.url,
@@ -134,6 +137,16 @@ class ContentConverter:
             if content.metadata.site_name:
                 frontmatter['site'] = content.metadata.site_name
                 
+        # Add Obsidian-specific metadata
+        frontmatter.update({
+            'tags': content.metadata.tags if content.metadata else [],
+            'links': content.metadata.internal_links if content.metadata else [],
+            'obsidian': {
+                'vault': self.obsidian_config.get('vault_name'),
+                'created': datetime.now().isoformat()
+            }
+        })
+        
         # Clean up None values
         frontmatter = {k: v for k, v in frontmatter.items() if v is not None}
         
@@ -213,24 +226,18 @@ class ContentConverter:
         return save_path
 
     async def _process_links(self, content: WebContent, markdown: str) -> str:
-        """Process and clean up links in the content."""
-        # Convert external links to reference style
-        links = {}
-        def repl(match):
-            url = match.group(2)
-            text = match.group(1)
-            if url not in links:
-                links[url] = len(links) + 1
-            return f"[{text}][{links[url]}]"
-            
-        markdown = re.sub(r'\[([^\]]+)\]\(([^\)]+)\)', repl, markdown)
+        """Process links with Obsidian-specific handling."""
+        # Convert standard markdown links to Obsidian wikilinks
+        markdown = re.sub(r'\[(.*?)\]\((.*?)\)', r'[[\1]]', markdown)
         
-        # Add reference definitions
-        if links:
-            markdown += "\n\n"
-            for url, num in links.items():
-                markdown += f"[{num}]: {url}\n"
-                
+        # Handle attachment links
+        if self.image_handling == ImageHandling.DOWNLOAD:
+            markdown = re.sub(
+                r'!\[(.*?)\]\(attachments/(.*?)\)',
+                r'![[attachments/\2]]',
+                markdown
+            )
+            
         return markdown
 
     async def bulk_convert(self, contents: List[WebContent],

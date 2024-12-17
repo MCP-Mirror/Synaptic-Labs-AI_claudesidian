@@ -57,7 +57,7 @@ class KnowledgeGraph:
             embedding_dimension: Dimension for node embeddings
         """
         # Main graph
-        self.graph = nx.DiGraph()
+        self.graph = nx.MultiDiGraph()
         
         # Index structures
         self._content_index = {}  # id -> content mapping
@@ -75,60 +75,16 @@ class KnowledgeGraph:
         self._cache = {}
         self._cache_ttl = 300  # 5 minutes
         
-    async def add_node(self, node_id: str, content: str,
-                      node_type: str = 'note',
-                      metadata: Optional[Dict] = None) -> Node:
+    async def add_node(self, node_id: str, attributes: Dict[str, Any]) -> None:
         """
-        Add a node to the graph.
+        Add a node to the graph with attributes.
         
         Args:
-            node_id: Unique identifier for node
-            content: Node content
-            node_type: Type of node
-            metadata: Optional metadata
-            
-        Returns:
-            Created Node object
+            node_id: Unique identifier for the node
+            attributes: Dictionary of node attributes
         """
-        # Create node object
-        node = Node(
-            id=node_id,
-            type=node_type,
-            content=content,
-            metadata=metadata or {},
-            created=datetime.now(),
-            modified=datetime.now()
-        )
-        
-        # Create embedding
-        if content:
-            node.embedding = await self._generate_embedding(content)
-            
-        # Add to graph
-        self.graph.add_node(
-            node_id,
-            **asdict(node)
-        )
-        
-        # Update indexes
-        self._content_index[node_id] = content
-        
-        if node_type not in self._type_index:
-            self._type_index[node_type] = set()
-        self._type_index[node_type].add(node_id)
-        
-        # Index tags from metadata
-        if metadata and 'tags' in metadata:
-            for tag in metadata['tags']:
-                if tag not in self._tag_index:
-                    self._tag_index[tag] = set()
-                self._tag_index[tag].add(node_id)
-                
-        # Clear cache
-        self._clear_cache()
-        
-        return node
-        
+        self.graph.add_node(node_id, **attributes)
+
     async def add_edge(self, source: str, target: str,
                       edge_type: str, strength: float = 1.0,
                       metadata: Optional[Dict] = None,

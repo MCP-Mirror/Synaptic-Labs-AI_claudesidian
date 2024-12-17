@@ -15,6 +15,7 @@ import numpy as np
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.metrics.pairwise import cosine_similarity
 import re
+import asyncio
 
 logger = logging.getLogger(__name__)
 
@@ -55,6 +56,11 @@ class RelationshipManager:
         # Pattern detection
         self._pattern_cache = {}
         self._cooccurrence_matrix = defaultdict(lambda: defaultdict(int))
+        
+        # Use more efficient data structures
+        self._relationship_cache = defaultdict(dict)
+        self._similarity_matrix = {}
+        self._batch_size = 100
         
     async def analyze_connections(self, content: str, 
                                 related_notes: List[Dict],
@@ -105,6 +111,20 @@ class RelationshipManager:
         relationships.extend(pattern_rels)
         
         return relationships
+        
+    async def analyze_connections_batch(self, contents: List[str],
+                                     contexts: List[Dict]) -> List[List[Dict[str, Any]]]:
+        """Analyze connections for multiple contents in batch."""
+        results = []
+        for i in range(0, len(contents), self._batch_size):
+            batch = contents[i:i + self._batch_size]
+            batch_contexts = contexts[i:i + self._batch_size]
+            batch_results = await asyncio.gather(*[
+                self.analyze_connections(content, [], context)
+                for content, context in zip(batch, batch_contexts)
+            ])
+            results.extend(batch_results)
+        return results
         
     async def find_paths(self, notes: List[Dict],
                         context: Dict,
