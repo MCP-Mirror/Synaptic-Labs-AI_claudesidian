@@ -1,43 +1,24 @@
-# claudesidian
-An MCP server for your second brain.
+# Claudesidian
+An MCP server to have full control of your obsidian vault (and much more!)
 
-claudesidian/
-├── pyproject.toml                 # Project metadata and dependencies
-├── README.md                      # Project documentation
-├── claudesidian/
-│   ├── __init__.py               # Package initialization
-│   ├── server.py                 # Main MCP server implementation
-│   ├── config.py                 # Configuration management
-│   │
-│   ├── core/                     # Core vault operations
-│   │   ├── __init__.py
-│   │   ├── vault.py             # Obsidian vault management
-│   │   ├── notes.py             # Note CRUD operations
-│   │   └── frontmatter.py       # Frontmatter parsing/generation
-│   │
-│   ├── web/                      # Web scraping capabilities
-│   │   ├── __init__.py
-│   │   ├── scraper.py           # Puppeteer integration for scraping
-│   │   ├── parser.py            # HTML/content parsing
-│   │   └── converter.py         # Web content to note conversion
-│   │
-│   ├── memory/                   # Memory system implementation
-│   │   ├── __init__.py
-│   │   ├── manager.py           # Main memory system manager
-│   │   ├── graph.py             # Knowledge graph implementation
-│   │   ├── relationships.py     # Relationship management
-│   │   ├── decay.py            # Memory decay system
-│   │   └── moc.py              # Maps of Content generation
-│   │
-│   ├── types/                    # Type definitions
-│   │   ├── __init__.py
-│   │   ├── memory.py            # Memory-related types
-│   │   ├── web.py              # Web-related types
-│   │   └── vault.py            # Vault-related types
-│   │
-│   └── utils/                    # Shared utilities
-│       ├── __init__.py
-│       ├── async_helpers.py     # Async utility functions
-│       ├── text.py             # Text processing utilities
-│       └── paths.py            # Path manipulation utilities
-│
+Under Construction, open to contributions!
+
+## Instructions
+1. Find your claude_desktop_config (int he desktop app go to settings, developer, config, open it.
+2. Input the following into the config file
+```json
+{
+  "mcpServers": {
+    "claudesidian_mcp": {
+      "command": "claudesidian",
+      "args": [
+        "path/to/your/vault"
+      ]
+    }
+  }
+}
+```
+3. Clone the Repo
+4. Open up your terminal and type in `pip install e .` (don't forget the period)
+5. After everything is built/installed type in `claudesidian "path/to/your/vault"` and hit enter.
+6. Open the Claude Desktop app (or fully restart, by ending it as a task in your task manager), start a new chat, and ask it to do things like search, add, or edit notes in your vault.
