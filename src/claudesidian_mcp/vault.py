@@ -12,6 +12,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Dict, List, Optional, Set, Tuple
 import time
+from concurrent.futures import ThreadPoolExecutor
 
 @dataclass
 class VaultMetadata:
@@ -57,6 +58,9 @@ class VaultManager:
         self._note_list_cache = None
         self._note_list_cache_time = 0
         self._cache_ttl = 30  # Cache TTL in seconds
+        self._executor = ThreadPoolExecutor(max_workers=4)
+        self._file_queue = asyncio.Queue(maxsize=100)
+        self._watched_paths = set()
 
     async def get_note(self, path: Path) -> Optional[VaultNote]:
         """
@@ -209,31 +213,28 @@ class VaultManager:
             return self._note_list_cache
 
         notes = []
-        try:
-            # Process files in parallel
-            async def process_file(file_path: Path) -> Optional[VaultNote]:
-                if any(part.startswith('.') for part in file_path.parts):
-                    return None
-                    
-                relative_path = file_path.relative_to(self.vault_path)
-                return await self.get_note(relative_path)
+        batch_size = 50  # Process files in batches
+        tasks = []
+        
+        async def process_batch(batch):
+            return await asyncio.gather(*[
+                self.get_note(file_path.relative_to(self.vault_path))
+                for file_path in batch
+                if not any(part.startswith('.') for part in file_path.parts)
+            ])
 
-            # Create tasks for all markdown files
-            tasks = []
-            for file_path in self.vault_path.rglob("*.md"):
-                tasks.append(asyncio.create_task(process_file(file_path)))
+        # Collect all markdown files
+        md_files = list(self.vault_path.rglob("*.md"))
+        
+        # Process in batches
+        for i in range(0, len(md_files), batch_size):
+            batch = md_files[i:i + batch_size]
+            results = await process_batch(batch)
+            notes.extend([note for note in results if note is not None])
 
-            # Gather results
-            results = await asyncio.gather(*tasks)
-            notes = [note for note in results if note is not None]
-            
-            # Update cache
-            self._note_list_cache = notes
-            self._note_list_cache_time = current_time
-                    
-        except Exception as e:
-            print(f"Error listing notes: {e}")
-            
+        self._note_list_cache = notes
+        self._note_list_cache_time = current_time
+        
         return notes
 
     async def _get_metadata(self, path: Path, content: str) -> VaultMetadata:
@@ -311,7 +312,12 @@ class VaultManager:
         if path in self._note_cache:
             return self._note_cache[path]
             
-        content = await asyncio.to_thread(path.read_text, encoding='utf-8')
+        loop = asyncio.get_event_loop()
+        content = await loop.run_in_executor(
+            self._executor,
+            lambda: path.read_text(encoding='utf-8')
+        )
+        
         self._note_cache[path] = content
         return content
 
@@ -336,6 +342,10 @@ class VaultManager:
             self._metadata_cache.clear()
         elif path in self._metadata_cache:
             del self._metadata_cache[path]
+
+    async def cleanup(self):
+        """Clean up resources"""
+        self._executor.shutdown(wait=False)
 
 from pathlib import Path
 from typing import Optional

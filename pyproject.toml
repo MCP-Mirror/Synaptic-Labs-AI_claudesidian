@@ -8,9 +8,13 @@ version = "0.1.0"
 description = "MCP server for Obsidian vault interaction"
 requires-python = ">=3.9"
 dependencies = [
-    "mcp",
-    "fuzzywuzzy",
-    "python-Levenshtein",
+    "mcp",                    # Core MCP functionality
+    "fuzzywuzzy",            # Fuzzy string matching
+    "python-Levenshtein",    # Faster Levenshtein distance calculations
+    "playwright",            # Web scraping
+    "pydantic",              # Data validation
+    "python-dotenv",         # Environment variable management
+    "anyio",                 # Async I/O support
 ]
 
 [project.scripts]
@@ -18,3 +22,12 @@ claudesidian = "claudesidian_mcp.server:main"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/claudesidian_mcp"]
+
+[project.optional-dependencies]
+dev = [
+    "pytest",
+    "pytest-asyncio",
+    "black",
+    "isort",
+    "mypy"
+]
