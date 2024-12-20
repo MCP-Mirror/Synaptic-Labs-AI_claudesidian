@@ -839,18 +839,19 @@ class RelationshipsTool(Tool):
         """Create or update a relationship entry."""
         try:
             name = arguments.get("name")
-            safe_name = name.replace(" ", "_")
+            # Use the actual name for both the file and display
             
             # Create metadata and content
             metadata = {
                 "type": arguments.get("type"),
-                "title": arguments.get("title"),
+                "title": name,
                 "organization": arguments.get("organization"),
-                "tags": self.vault.normalize_tags(arguments.get("tags", [])),  # Normalize tags
+                "tags": self.vault.normalize_tags(arguments.get("tags", [])),  # Still normalize tags
                 "last_updated": datetime.now().isoformat(),
                 "last_interaction": arguments.get("last_interaction")
             }
             
+            # Use original name everywhere
             content = f"""# {name}
 
 ## Description
@@ -887,8 +888,8 @@ class RelationshipsTool(Tool):
             if arguments.get("notes"):
                 content += f"## Notes\n{arguments['notes']}\n"
 
-            # Save the note
-            note_path = Path(f"claudesidian/relationships/{safe_name}.md")
+            # Save the note using the actual name
+            note_path = Path(f"claudesidian/relationships/{name}.md")
             note = await self.vault.create_note(
                 path=note_path,
                 content=content,
@@ -898,9 +899,9 @@ class RelationshipsTool(Tool):
             if not note:
                 return ["Failed to create relationship note"]
 
-            # Update index with a description line
+            # Use actual name in index link
             index_path = Path("claudesidian/index.md")
-            index_content = f"- [[{safe_name}]] - {arguments['description']}\n"
+            index_content = f"- [[{name}]] - {arguments['description']}\n"  # No need for alt text syntax
             await self.vault.update_note(
                 path=index_path,
                 content=index_content,

@@ -1,50 +1,90 @@
-# Claudesidian
+# Claudesidian MCP Server
 
-A bridge between Claude and Obsidian using the MCP protocol.
+## Introduction
 
-## Installation
+Welcome to the **Claudesidian MCP Server**! This project allows seamless interaction with your Obsidian vault through a robust server setup. Whether you're a beginner or an experienced user, follow these step-by-step instructions to get the server up and running.
 
-1. Ensure you have Python 3.9 or newer installed
-2. Install the package:
-   ```bash
-   pip install claudesidian
-   ```
+## Prerequisites
 
-## Configuration
+Before setting up the server, ensure you have the following installed on your system:
 
-1. Locate your Claude Desktop configuration file:
-   - Windows: `%APPDATA%/Claude/claude_desktop_config.json`
-   - macOS: `~/Library/Application Support/Claude/claude_desktop_config.json`
-   - Linux: `~/.config/Claude/claude_desktop_config.json`
+- [Python 3.9+](https://www.python.org/downloads/)
+- [Git](https://git-scm.com/downloads)
+- [Playwright](https://playwright.dev/docs/intro) (for web scraping capabilities)
 
-2. Add the following to your configuration file:
+## Installation Steps
+
+1. **Clone the Repository via Your IDE**
+
+   Open your preferred IDE (e.g., Visual Studio Code) and follow these steps to clone the repository:
+
+   **Using Visual Studio Code:**
+
+   - Open VS Code.
+   - Click on the **Source Control** icon in the Activity Bar on the side.
+   - Click on **Clone Repository**.
+   - Enter the repository URL: `https://github.com/Synaptic-Labs-AI/claudesidian.git`.
+   - Choose a local directory where you want to save the project.
+   - After cloning, open the project folder in VS Code.
+
+2. **Configure `claude_desktop_config.json`**
+
+   Update the `claude_desktop_config.json` file with the correct paths:
+
    ```json
    {
      "mcpServers": {
        "claudesidian": {
          "command": "claudesidian",
          "args": [
-           "path/to/your/obsidian/vault"
+           "PATH_TO_YOUR_OBSIDIAN_VAULT"
          ]
        }
      }
    }
    ```
-   Replace `path/to/your/obsidian/vault` with the actual path to your Obsidian vault.
 
-3. **Optional:** If you've set up environment variables or additional configurations, ensure they are correctly referenced here.
+   - Replace `PATH_TO_YOUR_OBSIDIAN_VAULT` with the actual path to your Obsidian vault directory.
 
-## Usage
+3. **Install Dependencies**
 
-1. Start Claude Desktop
-2. The connection to your Obsidian vault will be established automatically
-3. You can now use Claude to interact with your vault
+   ```bash
+   pip install -e .
+   ```
+
+4. **Run the Server**
+
+   ```bash
+   claudesidian "PATH_TO_YOUR_OBSIDIAN_VAULT"
+   ```
+
+   - Replace `PATH_TO_YOUR_OBSIDIAN_VAULT` with the actual path to your Obsidian vault directory.
+
+## Available Tools
+
+- **Reasoning Tool**: Manages reasoning schemas to guide complex problem-solving processes.
+- **CreateMemory Tool**: Stores important information as memories at the end of each interaction.
+- **FuzzySearch Tool**: Performs fuzzy searches within the vault to find relevant notes quickly.
+- **ScrapeWebsite Tool**: Scrapes authorized web content and archives it as notes in your vault.
+- **CreateNote Tool**: Facilitates the creation of new notes within your Obsidian vault.
+- **EditNote Tool**: Allows editing of existing notes in the vault.
+- **MemoryRetrieval Tool**: Retrieves and synthesizes memories from the vault based on queries.
+- **Relationships Tool**: Manages relationship information and connections between different notes or entities.
 
 ## Troubleshooting
 
 If you encounter any issues:
 
-1. Check that your vault path is correct and accessible
-2. Ensure Python is in your system PATH
-3. Try running `claudesidian --version` in your terminal to verify the installation
-4. Check the Claude Desktop logs for any error messages
+1. Ensure that your terminal in the IDE is opened in the correct project directory before running install and run commands.
+2. Check that your vault path is correct and accessible.
+3. Ensure Python is in your system PATH.
+4. Try running `claudesidian --version` in your terminal to verify the installation.
+5. Check the Claude Desktop logs for any error messages. You can navigate to the logs directory at `C:/Users/<YourUsername>/AppData/Roaming/Claude/logs`.
+
+### Contributions
+
+We welcome contributions from the community! Here are ways you can help:
+
+- **QA Testing**: Help us identify bugs and improve the server's stability.
+- **Enhancements**: Suggest or implement new features to expand functionality.
+- **Feedback**: Leave your comments and suggestions in the [discussion](https://github.com/Synaptic-Labs-AI/claudesidian/discussions) section to help guide future developments.
