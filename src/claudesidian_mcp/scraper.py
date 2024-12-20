@@ -1,13 +1,21 @@
 import asyncio
-from playwright.async_api import async_playwright, Page, Browser
 from typing import Dict
 import sys
+from playwright.async_api import async_playwright, Page, Browser
 
 class RobustScraper:
+    """
+    A scraper optimized for speed:
+    - Uses a single browser context and page for multiple scrapes (if desired).
+    - Minimizes waiting by using lighter load states.
+    - Optionally reduces overhead like excessive scrolling/waiting.
+    """
+
     def __init__(self):
         self._browser: Browser = None
         self._playwright = None
         self._playwright_context = None
+        self._page: Page = None
         self._initialized = False
         self._shutdown = False
 
@@ -21,15 +29,19 @@ class RobustScraper:
     async def setup(self):
         if self._initialized:
             return
+
         try:
             self._playwright_context = async_playwright()
             self._playwright = await self._playwright_context.__aenter__()
-            # Ensure browsers are installed: `playwright install`
+            # Launch the browser once and keep it running
             self._browser = await self._playwright.chromium.launch(headless=True)
+            # Create a single persistent context and page
+            context = await self._browser.new_context()
+            self._page = await context.new_page()
             self._initialized = True
-            print("Browser initialized successfully", file=sys.stderr)
+            print("[Scraper] Browser and page initialized successfully", file=sys.stderr)
         except Exception as e:
-            print(f"Failed to initialize browser: {e}", file=sys.stderr)
+            print(f"[Scraper] Failed to initialize browser: {e}", file=sys.stderr)
             await self.cleanup()
             raise
 
@@ -39,117 +51,120 @@ class RobustScraper:
             try:
                 await self._browser.close()
             except Exception as e:
-                print(f"Error closing browser: {e}", file=sys.stderr)
+                print(f"[Scraper] Error closing browser: {e}", file=sys.stderr)
             self._browser = None
 
         if self._playwright_context:
             try:
                 await self._playwright_context.__aexit__(None, None, None)
             except Exception as e:
-                print(f"Error stopping playwright: {e}", file=sys.stderr)
+                print(f"[Scraper] Error stopping playwright: {e}", file=sys.stderr)
             self._playwright = None
             self._playwright_context = None
 
+        self._page = None
         self._initialized = False
 
-    async def _get_page(self) -> Page:
-        if self._shutdown or not self._initialized:
-            raise RuntimeError("Scraper is not running or browser not initialized.")
-        # Create a fresh context and page each time
-        context = await self._browser.new_context()
-        page = await context.new_page()
-        return page
-
     async def search_and_scrape(self, query: str) -> Dict[str, str]:
-        # This is a simpler version without retries. 
-        # The caller can implement retry logic if desired.
-        if not self._initialized:
-            raise RuntimeError("Scraper not initialized.")
+        """
+        Scrape a given URL or domain quickly.
+        
+        Steps taken to maximize speed:
+        - Reuse a single page and browser context.
+        - Use simpler wait conditions.
+        - Limit unnecessary scrolling if the page loads static content fast enough.
+        """
+        if self._shutdown or not self._initialized:
+            raise RuntimeError("Scraper not running or browser not initialized.")
 
-        page = await self._get_page()
+        # Construct URL
+        url = f"https://{query}" if not query.startswith(('http://', 'https://')) else query
+        print(f"[Scraper] Loading URL: {url}", file=sys.stderr)
+
+        # Navigate with less strict waiting criteria for speed
+        # 'load' waits for the load event, usually faster than 'networkidle'
+        await self._page.goto(url, wait_until='load', timeout=60000)
+
+        # Optional: If dynamic content is needed, attempt a quick scroll
+        await self._auto_scroll(self._page)
+
+        # Try waiting a short while for any late-loading content
+        # Shorter timeout for speed
         try:
-            # Attempt direct URL first
-            url = f"https://{query}" if not query.startswith(('http://', 'https://')) else query
-            print(f"Attempting to load URL: {url}", file=sys.stderr)
-            await page.goto(url, wait_until='networkidle', timeout=300000)  # Changed wait_until to 'networkidle'
+            await self._page.wait_for_load_state('domcontentloaded', timeout=5000)
+        except asyncio.TimeoutError:
+            print("[Scraper] DOM content load check timed out, continuing anyway", file=sys.stderr)
 
-            # Scroll to the bottom to load dynamic content
-            await self._auto_scroll(page)
+        # Ensure body is present
+        try:
+            await self._page.wait_for_selector('body', timeout=5000)
+        except asyncio.TimeoutError:
+            print("[Scraper] 'body' selector not found quickly, continuing with what we have", file=sys.stderr)
 
-            # Wait for additional network idle after scrolling
-            try:
-                await page.wait_for_load_state('networkidle', timeout=10000)
-            except asyncio.TimeoutError:
-                print("Network did not become fully idle after scrolling, continuing...", file=sys.stderr)
+        # Extract content
+        content = await self._extract_content(self._page)
+        title = await self._page.title() or query
+        final_url = self._page.url
 
-            await page.wait_for_selector('body', timeout=50000)
-
-            # Enhanced content extraction
-            content = await page.evaluate('''() => {
-                const selectors = ['article', 'main', 'section', 'div'];
-                let text = '';
-                selectors.forEach(selector => {
-                    const elements = document.querySelectorAll(selector);
-                    elements.forEach(el => {
-                        text += el.innerText + '\\n';
-                    });
-                });
-                if (!text) {
-                    // Fallback to TreeWalker if no specific selectors found
-                    const walker = document.createTreeWalker(
-                        document.body,
-                        NodeFilter.SHOW_TEXT,
-                        {
-                            acceptNode: function(node) {
-                                if (node.parentElement && ['SCRIPT','STYLE','NOSCRIPT','IFRAME'].includes(node.parentElement.tagName)) {
-                                    return NodeFilter.FILTER_REJECT;
-                                }
-                                return NodeFilter.FILTER_ACCEPT;
-                            }
-                        }
-                    );
-                    let node;
-                    while ((node = walker.nextNode())) {
-                        text += node.textContent + '\\n';
-                    }
-                }
-                return text.trim() || 'No content found';
-            }''')
-
-            title = await page.title() or query
-            final_url = page.url
-
-            return {
-                'title': title,
-                'url': final_url,
-                'content': content
-            }
-        finally:
-            await page.context.close()
+        return {
+            'title': title,
+            'url': final_url,
+            'content': content
+        }
 
     async def _auto_scroll(self, page: Page) -> None:
-        """Automatically scrolls the page to load dynamic content."""
+        """
+        Quickly scroll to bottom for dynamic content.
+        Faster interval and lower total wait times.
+        """
         await page.evaluate('''async () => {
-            await new Promise((resolve) => {
-                let totalHeight = 0;
-                const distance = 100;
-                const timer = setInterval(() => {
-                    const scrollHeight = document.body.scrollHeight;
-                    window.scrollBy(0, distance);
-                    totalHeight += distance;
-
-                    if(totalHeight >= scrollHeight){
-                        clearInterval(timer);
-                        resolve();
-                    }
-                }, 100);
-            });
+            const distance = 200; 
+            const maxScrollAttempts = 10; 
+            for (let i = 0; i < maxScrollAttempts; i++) {
+                const previousHeight = document.body.scrollHeight;
+                window.scrollBy(0, distance);
+                await new Promise(r => setTimeout(r, 100));
+                const newHeight = document.body.scrollHeight;
+                if (newHeight === previousHeight) break;
+            }
         }''')
 
-# Example usage (uncomment to test):
-# if __name__ == "__main__":
-#     async def main():
-#         async with RobustScraper() as scraper:
-#             result = await scraper.search_and_scrape("example.com")
-#             print(result)
-#     asyncio.run(main())
+    async def _extract_content(self, page: Page) -> str:
+        """
+        Extract readable text content from the page quickly.
+        Focus on main content selectors first, fallback to a text walker.
+        """
+        content = await page.evaluate('''() => {
+            const selectors = ['article', 'main', 'section', 'div'];
+            let text = '';
+            for (const selector of selectors) {
+                const elements = document.querySelectorAll(selector);
+                for (const el of elements) {
+                    const innerText = el.innerText.trim();
+                    if (innerText) text += innerText + '\\n';
+                }
+            }
+            if (!text) {
+                // Simple fallback: grab all text nodes
+                const walker = document.createTreeWalker(
+                    document.body,
+                    NodeFilter.SHOW_TEXT,
+                    {
+                        acceptNode: function(node) {
+                            const parentTag = node.parentElement && node.parentElement.tagName;
+                            if (parentTag && ['SCRIPT','STYLE','NOSCRIPT','IFRAME'].includes(parentTag)) {
+                                return NodeFilter.FILTER_REJECT;
+                            }
+                            return NodeFilter.FILTER_ACCEPT;
+                        }
+                    }
+                );
+                let node;
+                while ((node = walker.nextNode())) {
+                    const nodeText = node.textContent.trim();
+                    if (nodeText) text += nodeText + '\\n';
+                }
+            }
+            return text.trim() || 'No content found';
+        }''')
+        return content

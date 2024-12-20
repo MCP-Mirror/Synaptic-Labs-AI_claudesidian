@@ -7,14 +7,26 @@ name = "claudesidian"
 version = "0.1.0"
 description = "MCP server for Obsidian vault interaction"
 requires-python = ">=3.9"
+authors = [
+    {name = "Your Name", email = "your.email@example.com"}
+]
+readme = "README.md"
+license = {text = "MIT"}
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: End Users/Desktop",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.9",
+]
 dependencies = [
     "mcp",                    # Core MCP functionality
-    "fuzzywuzzy",            # Fuzzy string matching
+    "rapidfuzz",            # Fuzzy string matching
     "python-Levenshtein",    # Faster Levenshtein distance calculations
     "playwright",            # Web scraping
     "pydantic",              # Data validation
     "python-dotenv",         # Environment variable management
     "anyio",                 # Async I/O support
+    "PyYAML",                # YAML parsing and dumping
 ]
 
 [project.scripts]
@@ -22,6 +34,10 @@ claudesidian = "claudesidian_mcp.server:main"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/claudesidian_mcp"]
+include = [
+    "/src/claudesidian_mcp/**/*.py",
+    "/src/claudesidian_mcp/**/*.json"
+]
 
 [project.optional-dependencies]
 dev = [
@@ -31,3 +47,7 @@ dev = [
     "isort",
     "mypy"
 ]
+
+[project.urls]
+Homepage = "https://github.com/yourusername/claudesidian"
+Repository = "https://github.com/yourusername/claudesidian.git"

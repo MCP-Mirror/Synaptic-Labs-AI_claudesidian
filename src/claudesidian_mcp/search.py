@@ -1,248 +1,228 @@
 """
-Search functionality for Obsidian vault.
-Provides fuzzy searching capabilities with configurable matching strategies.
+Memory management module optimized for speed.
+Uses rapidfuzz for fuzzy matching instead of fuzzywuzzy, minimizes overhead.
 """
 
+import sys
 import asyncio
-from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
-from typing import List, Optional, Tuple, AsyncGenerator
-from fuzzywuzzy import fuzz
-import heapq
+from typing import List, Dict, Any, Optional
+from rapidfuzz import fuzz, process
+
+from .vault import VaultManager
+
+class MemoryManager:
+    """Manages memory operations using the vault as a backing store quickly and efficiently."""
+
+    def __init__(self, vault: VaultManager):
+        self.vault = vault
+        self._memory_folder = Path("memory")
+
+    async def create_memory(
+        self,
+        title: str,
+        content: str,
+        memory_type: str,
+        categories: List[str],
+        description: str,
+        relationships: List[str],
+        tags: List[str]
+    ) -> Optional[Dict[str, Any]]:
+        """
+        Create a new memory entry with YAML metadata and store it in the vault.
+        Focus on quick I/O by using the already established vault methods.
+        """
+        try:
+            metadata = {
+                "Title": title,
+                "Type": memory_type,
+                "Category": categories,
+                "Description": description,
+                "Relationships": relationships,
+                "Tags": tags,
+                "Date_created": datetime.now().isoformat(),
+                "Date_modified": datetime.now().isoformat()
+            }
+
+            note = await self.vault.create_note(
+                path=self._memory_folder / f"{title}.md",
+                content=content,
+                metadata=metadata
+            )
+
+            if note:
+                return {
+                    "title": note.title,
+                    "path": str(note.path),
+                    "metadata": note.metadata.yaml_frontmatter
+                }
+        except Exception as e:
+            print(f"[MemoryManager] Error creating memory: {e}", file=sys.stderr)
+
+        return None
+
+    async def strengthen_relationship(
+        self,
+        source_path: Path,
+        target_path: Path,
+        predicate: str
+    ) -> bool:
+        """
+        Strengthen a relationship between two memories, updating YAML frontmatter quickly.
+        """
+        try:
+            source_note, target_note = await asyncio.gather(
+                self.vault.get_note(source_path),
+                self.vault.get_note(target_path)
+            )
+
+            if not source_note or not target_note:
+                return False
+
+            relationships = source_note.metadata.yaml_frontmatter.get("Relationships", [])
+            relationship_str = f"#{predicate} [[{target_note.title}]]"
+            if relationship_str not in relationships:
+                relationships.append(relationship_str)
+
+            metadata = source_note.metadata.yaml_frontmatter
+            metadata["Relationships"] = relationships
+            metadata["Date_modified"] = datetime.now().isoformat()
+
+            # Update the note. For speed, assume full replacement with new YAML is okay.
+            return await self.vault.update_note(
+                path=source_path,
+                content=source_note.content,
+                mode="replace"
+            )
+        except Exception as e:
+            print(f"[MemoryManager] Error strengthening relationship: {e}", file=sys.stderr)
+            return False
+
+    async def search_relevant_memories(
+        self,
+        query: str,
+        threshold: float = 60.0
+    ) -> List[Dict[str, Any]]:
+        """
+        Search for relevant memories using rapidfuzz for faster fuzzy matching.
+        Minimizes loops and does direct lookups to speed up matching.
+
+        Steps:
+        1. Fetch all memory notes once.
+        2. Use rapidfuzz.process.extract to get matches above threshold.
+        """
+        try:
+            all_notes = await self.vault.get_all_notes()
+            # Filter memory notes
+            memory_notes = [n for n in all_notes if "memory/" in str(n.path)]
+            # Create a dict for quick lookup by title
+            memory_map = {n.title: n for n in memory_notes}
+
+            # Extract titles and perform fuzzy matching
+            titles = list(memory_map.keys())
+            matches = process.extract(query, titles, scorer=fuzz.partial_ratio, limit=None)
+
+            # Filter by threshold and build results
+            relevant_memories = []
+            for (title, score, _) in matches:
+                if score >= threshold:
+                    note = memory_map[title]
+                    content = note.content
+                    preview = content[:200] + "..." if len(content) > 200 else content
+                    relevant_memories.append({
+                        "title": title,
+                        "path": str(note.path),
+                        "preview": preview,
+                        "metadata": note.metadata.yaml_frontmatter
+                    })
+
+            # Sort by score descending
+            relevant_memories.sort(key=lambda x: x["metadata"].get("Date_modified", ""), reverse=True)
+            return relevant_memories
+        except Exception as e:
+            print(f"[MemoryManager] Error searching memories: {e}", file=sys.stderr)
+            return []
+
+"""
+Search module for efficient fuzzy searching within the Obsidian vault.
+"""
+
+import sys
+from pathlib import Path
+from typing import List, Dict, Any
+from dataclasses import dataclass
+from rapidfuzz import fuzz, process
+import time
 
 @dataclass
 class SearchResult:
-    """
-    Represents a single search result with its metadata.
-    """
+    """Represents a single search result."""
+    title: str
     file_path: Path
     score: float
-    title: str
     preview: str
-    match_context: str = ""
 
-    def to_dict(self) -> dict:
-        """Convert the search result to a dictionary format."""
-        return {
-            "path": str(self.file_path),
-            "score": self.score,
-            "title": self.title,
-            "preview": self.preview,
-            "match_context": self.match_context
-        }
+@dataclass
+class IndexEntry:
+    """Represents an indexed file."""
+    title: str
+    file_path: Path
+    content: str
+    last_modified: float
 
 class SearchEngine:
-    """
-    Core search engine that handles fuzzy searching through the vault.
-    Supports both filename and content searching with configurable parameters.
-    """
-    
-    def __init__(self, vault_path: Path, max_preview_length: int = 200):
-        """
-        Initialize the search engine.
-        
-        Args:
-            vault_path (Path): Root path of the Obsidian vault
-            max_preview_length (int): Maximum length of content previews
-        """
-        self.vault_path = vault_path
-        self.max_preview_length = max_preview_length
-        self._file_cache = {}  # Future: Implement LRU cache
+    """Handles fuzzy searching within the Obsidian vault with indexing."""
 
-    async def search(self, 
-                    query: str, 
-                    threshold: float = 60.0,
-                    max_results: int = 10,
-                    search_contents: bool = True) -> List[SearchResult]:
-        """
-        Perform a fuzzy search through the vault.
-        
-        Args:
-            query (str): Search query
-            threshold (float): Minimum similarity score (0-100)
-            max_results (int): Maximum number of results to return
-            search_contents (bool): Whether to search file contents
+    def __init__(self, vault: VaultManager):
+        """Initialize search engine with vault path."""
+        self.vault = vault
+        self.index = []
+        self._template_dirs = ['templates', '📜 templates']  # Directories to skip
+
+    def _should_skip_file(self, path: Path) -> bool:
+        """Check if file should be skipped during indexing."""
+        path_str = str(path).lower()
+        return any(tdir in path_str.lower() for tdir in self._template_dirs)
+
+    async def build_index(self):
+        """Build the search index by indexing all notes in the vault."""
+        try:
+            print("[Search] Building search index...", file=sys.stderr)
+            notes = await self.vault.get_all_notes()
+            indexed_count = 0
+            skipped_count = 0
+            self.index = []
             
-        Returns:
-            List[SearchResult]: Sorted list of search results
-        """
+            for note in notes:
+                try:
+                    if self._should_skip_file(note.path):
+                        skipped_count += 1
+                        continue
+                        
+                    self.index.append((note.title, note.content))
+                    indexed_count += 1
+                    
+                except Exception as e:
+                    skipped_count += 1
+                    if not self._should_skip_file(note.path):
+                        print(f"[Search] Error indexing '{note.path}': {e}", file=sys.stderr)
+            
+            print(f"[Search] Index built: {indexed_count} files indexed, {skipped_count} files skipped", file=sys.stderr)
+        except Exception as e:
+            print(f"[Search] Error building search index: {e}", file=sys.stderr)
+
+    async def search(self, query: str, threshold: int = 60, max_results: int = 10) -> List[Dict[str, Any]]:
+        titles = [title for (title, _) in self.index]
+        matches = process.extract(query, titles, scorer=fuzz.partial_ratio, limit=max_results)
         results = []
-        async for result in self._search_files(query, threshold, search_contents):
-            heapq.heappush(results, (-result.score, result))
-            if len(results) > max_results:
-                heapq.heappop(results)
-                
-        return [result for _, result in sorted(results, reverse=True)]
-
-    async def _search_files(self, 
-                          query: str, 
-                          threshold: float,
-                          search_contents: bool) -> AsyncGenerator[SearchResult, None]:
-        """
-        Generator that yields search results as they're found.
-        
-        Args:
-            query (str): Search query
-            threshold (float): Minimum similarity score
-            search_contents (bool): Whether to search file contents
-        """
-        search_tasks = []
-        
-        for file_path in self.vault_path.rglob("*.md"):
-            # Skip hidden files and directories
-            if any(part.startswith('.') for part in file_path.parts):
-                continue
-                
-            task = asyncio.create_task(
-                self._process_file(file_path, query, threshold, search_contents)
-            )
-            search_tasks.append(task)
-            
-            # Process in batches to avoid memory overload
-            if len(search_tasks) >= 50:
-                for result in await self._gather_results(search_tasks):
-                    if result:
-                        yield result
-                search_tasks = []
-        
-        # Process remaining files
-        if search_tasks:
-            for result in await self._gather_results(search_tasks):
-                if result:
-                    yield result
-
-    async def _gather_results(self, tasks: List[asyncio.Task]) -> List[Optional[SearchResult]]:
-        """
-        Gather results from multiple search tasks.
-        
-        Args:
-            tasks (List[asyncio.Task]): List of search tasks
-            
-        Returns:
-            List[Optional[SearchResult]]: List of search results
-        """
-        try:
-            results = await asyncio.gather(*tasks, return_exceptions=True)
-            return [r for r in results if isinstance(r, SearchResult)]
-        except Exception as e:
-            print(f"Error gathering results: {e}")
-            return []
-
-    async def _process_file(self, 
-                          file_path: Path, 
-                          query: str, 
-                          threshold: float,
-                          search_contents: bool) -> Optional[SearchResult]:
-        """
-        Process a single file for matches.
-        
-        Args:
-            file_path (Path): Path to the file
-            query (str): Search query
-            threshold (float): Minimum similarity score
-            search_contents (bool): Whether to search file contents
-            
-        Returns:
-            Optional[SearchResult]: Search result if match found
-        """
-        try:
-            filename_score = fuzz.partial_ratio(query.lower(), file_path.stem.lower())
-            content_score = 0
-            preview = ""
-            match_context = ""
-
-            if search_contents:
-                content = await self._read_file(file_path)
-                if content:
-                    content_score = self._score_content(query, content)
-                    if content_score >= threshold:
-                        preview, match_context = self._generate_preview(query, content)
-
-            # Use maximum score between filename and content
-            score = max(filename_score, content_score)
-            
+        for (match_title, score, idx) in matches:
             if score >= threshold:
-                return SearchResult(
-                    file_path=file_path.relative_to(self.vault_path),
-                    score=score,
-                    title=file_path.stem,
-                    preview=preview,
-                    match_context=match_context
-                )
-            
-        except Exception as e:
-            print(f"Error processing {file_path}: {e}")
-            
-        return None
-
-    async def _read_file(self, file_path: Path) -> Optional[str]:
-        """
-        Read file content with caching.
-        
-        Args:
-            file_path (Path): Path to the file
-            
-        Returns:
-            Optional[str]: File content if successful
-        """
-        try:
-            if file_path in self._file_cache:
-                return self._file_cache[file_path]
-            
-            content = await asyncio.to_thread(file_path.read_text, encoding='utf-8')
-            self._file_cache[file_path] = content
-            return content
-            
-        except Exception as e:
-            print(f"Error reading {file_path}: {e}")
-            return None
-
-    def _score_content(self, query: str, content: str) -> float:
-        """
-        Score content based on fuzzy matching.
-        
-        Args:
-            query (str): Search query
-            content (str): File content
-            
-        Returns:
-            float: Match score
-        """
-        # Split content into chunks for better matching
-        chunks = content.split('\n')
-        return max(
-            fuzz.partial_ratio(query.lower(), chunk.lower())
-            for chunk in chunks
-        )
-
-    def _generate_preview(self, query: str, content: str) -> Tuple[str, str]:
-        """
-        Generate a preview of the matched content.
-        
-        Args:
-            query (str): Search query
-            content (str): File content
-            
-        Returns:
-            Tuple[str, str]: (preview, match context)
-        """
-        lines = content.split('\n')
-        best_score = 0
-        best_line = 0
-        
-        # Find the best matching line
-        for i, line in enumerate(lines):
-            score = fuzz.partial_ratio(query.lower(), line.lower())
-            if score > best_score:
-                best_score = score
-                best_line = i
-        
-        # Generate preview with context
-        start = max(0, best_line - 2)
-        end = min(len(lines), best_line + 3)
-        context_lines = lines[start:end]
-        
-        preview = content[:self.max_preview_length] + "..." if len(content) > self.max_preview_length else content
-        match_context = "\n".join(context_lines)
-        
-        return preview, match_context
+                content = self.index[idx][1]
+                preview = content[:200] + "..." if len(content) > 200 else content
+                results.append({
+                    "title": match_title,
+                    "score": score,
+                    "content": preview
+                })
+        return results

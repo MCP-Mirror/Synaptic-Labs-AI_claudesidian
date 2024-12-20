@@ -1,29 +1,39 @@
-#!/usr/bin/env python3
+# server.py
+
 """
 MCP server for Obsidian vault interaction with fuzzy search capabilities.
 """
+
 import asyncio
 import os
 import sys
 import locale
 import time
+import re
+import hashlib
+import argparse
 from datetime import datetime
 from pathlib import Path
-from typing import Optional, Dict, Any
-from fuzzywuzzy import fuzz
+from typing import Optional, Dict, Any, List, Tuple
+
 from mcp.server import Server, NotificationOptions
 from mcp.server.models import InitializationOptions
 import mcp.server.stdio
 import mcp.types as types
-from .vault import VaultManager
 from pydantic import BaseModel
+from rapidfuzz import fuzz, process
+
+from .vault import VaultManager
 from .scraper import RobustScraper
 from .memory import MemoryManager
+from .reasoning import ReasoningManager
+from .tools import create_tools_registry, Tool  # Update import
+from .search import SearchEngine  # Add SearchEngine import
 
 # Ensure UTF-8 encoding on all platforms
-if sys.stdout.encoding != 'utf-8':
+if sys.stdout.encoding.lower() != 'utf-8':
     sys.stdout.reconfigure(encoding='utf-8')
-if sys.stderr.encoding != 'utf-8':
+if sys.stderr.encoding.lower() != 'utf-8':
     sys.stderr.reconfigure(encoding='utf-8')
 
 # Try to set locale to UTF-8 if possible
@@ -33,7 +43,6 @@ try:
     else:
         locale.setlocale(locale.LC_ALL, 'en_US.UTF-8')
 except locale.Error:
-    # If UTF-8 locale is not available, try the default locale
     locale.setlocale(locale.LC_ALL, '')
     print("Warning: Could not set UTF-8 locale", file=sys.stderr)
 
@@ -44,7 +53,7 @@ class AnyNotification(BaseModel):
 class ClaudesidianServer:
     """
     Main server class that handles MCP protocol implementation and tool registration.
-    Provides fuzzy search capabilities for an Obsidian vault.
+    Adjusted to start interactions with reasoning and end with memory storage.
     """
     
     def __init__(self, vault_path: Path):
@@ -56,406 +65,146 @@ class ClaudesidianServer:
         """
         self.vault_path = vault_path
         self.vault = VaultManager(vault_path)  # Initialize VaultManager
-        self.server = Server("claudesidian")  # Simplified server initialization
-        self.scraper = RobustScraper()  # Just create the instance
-        self.memory_manager = MemoryManager(self.vault)  # Add memory manager
-        self._setup_tools()  # Remove notification setup call
+        self.server = Server("claudesidian")  # Initialize MCP Server
+        self.scraper = RobustScraper()  # Initialize Scraper
+        self.memory_manager = MemoryManager(self.vault)  # Initialize MemoryManager
+        self.reasoning_manager = ReasoningManager(self.vault)  # Initialize ReasoningManager
         self._search_cache = {}
         self._cache_lock = asyncio.Lock()
         self._initializing = False
         self._initialized = False
         self._shutdown = False
 
+    async def _initialize_folder_structure(self):
+        """Initialize the basic folder structure and index file."""
+        print("Initializing folder structure...", file=sys.stderr)
+        
+        # Create base claudesidian folder
+        claudesidian_folder = self.vault_path / "claudesidian"
+        await self.vault.ensure_folder(claudesidian_folder)
+
+        # Create all required folders
+        folders = {
+            "memory": claudesidian_folder / "memory",
+            "reasoning": claudesidian_folder / "reasoning",
+            "websites": claudesidian_folder / "websites"
+        }
+        
+        for folder_path in folders.values():
+            await self.vault.ensure_folder(folder_path)
+
+        # Create or update single index file
+        index_path = claudesidian_folder / "index.md"
+        if not index_path.exists():
+            index_content = """# Claudesidian Index
+
+## Memories
+
+## Reasoning
+
+## Websites
+"""
+            index_path.write_text(index_content, encoding='utf-8')
+
+        print("Folder structure initialized", file=sys.stderr)
+
     async def setup(self):
         """Initialize all async components"""
         if self._initializing or self._initialized:
-            return self
+            return
         
         self._initializing = True
         try:
             print("Initializing server components...", file=sys.stderr)
-            try:
-                await self.scraper.setup()
-                self._initialized = True
-            except Exception as e:
-                print(f"Failed to initialize scraper: {e}", file=sys.stderr)
-                raise RuntimeError(f"Server initialization failed: {e}")
+            await self._initialize_folder_structure()
+            await self.scraper.setup()
+            print("Initializing search engine...", file=sys.stderr)
+            self.search_engine = SearchEngine(self.vault)
+            await self.search_engine.build_index()
             print("Server initialization complete", file=sys.stderr)
+        except Exception as e:
+            print(f"Error during setup: {e}", file=sys.stderr)
         finally:
             self._initializing = False
+        self._initialized = True
         return self
 
-    def _setup_tools(self) -> None:
-        """
-        Register all available tools with the MCP server.
-        """
+    def _setup_tools(self, dependencies: Dict[str, Any]) -> None:
+        """Register all available tools with the MCP server using the tools registry."""
         print("Setting up tools...", file=sys.stderr)
+        
+        # Ensure scraper is available in dependencies
+        dependencies["scraper"] = self.scraper
+        dependencies["search_engine"] = self.search_engine
+        
+        tools = create_tools_registry(self.vault, self.memory_manager, self.reasoning_manager)
 
         @self.server.list_tools()
-        async def handle_list_tools() -> list[types.Tool]:
+        async def handle_list_tools() -> List[types.Tool]:
             print("Listing tools...", file=sys.stderr)
             return [
                 types.Tool(
-                    name="fuzzy_search",
-                    description="Search for notes in the vault using fuzzy matching",
-                    inputSchema={
-                        "type": "object",
-                        "properties": {
-                            "query": {
-                                "type": "string",
-                                "description": "Search query"
-                            },
-                            "threshold": {
-                                "type": "number",
-                                "description": "Minimum similarity score (0-100)",
-                                "default": 60
-                            }
-                        },
-                        "required": ["query"]
-                    }
-                ),
-                types.Tool(
-                    name="create_note",
-                    description="Create a new note in the vault",
-                    inputSchema={
-                        "type": "object",
-                        "properties": {
-                            "title": {"type": "string", "description": "Note title"},
-                            "content": {"type": "string", "description": "Note content"},
-                            "folder": {"type": "string", "description": "Optional folder path"}
-                        },
-                        "required": ["title", "content"]
-                    }
-                ),
-                types.Tool(
-                    name="edit_note",
-                    description="Edit an existing note",
-                    inputSchema={  # Fix: Remove extra curly brace
-                        "type": "object",
-                        "properties": {
-                            "title": {"type": "string", "description": "Note title"},
-                            "content": {"type": "string", "description": "Content to add"},
-                            "mode": {"type": "string", "enum": ["append", "prepend"], "default": "append"},
-                            "heading": {"type": "string", "description": "Optional heading to add under"}
-                        },
-                        "required": ["title", "content"]
-                    }
-                ),
-                types.Tool(
-                    name="scrape_website",
-                    description="Scrape content from a website given a URL or domain name",
-                    inputSchema={
-                        "type": "object",
-                        "properties": {
-                            "url": {
-                                "type": "string",
-                                "description": "URL or domain name to scrape (e.g., 'example.com' or 'https://example.com')"
-                            },
-                            "name": {  # Added name property
-                                "type": "string",
-                                "description": "Name for the note to be created"
-                            }
-                        },
-                        "required": ["url", "name"]  # Made name required
-                    }
-                ),
-                types.Tool(
-                    name="create_memory",
-                    description="You are required to use this tool prior to every output to help inform your responses. ALWAYS USE IT. Create a new memory entry in the vault. Memories are structured notes that help build a knowledge graph of connected information.",
-                    inputSchema={
-                        "type": "object",
-                        "properties": {
-                            "title": {
-                                "type": "string", 
-                                "description": "A clear, descriptive title for the memory that captures its key concept"
-                            },
-                            "content": {
-                                "type": "string", 
-                                "description": "The main content or details of the memory. Be specific and include relevant context."
-                            },
-                            "memory_type": {
-                                "type": "string",
-                                "description": """Type of memory. Choose from:
-                                - core: Fundamental facts, beliefs, or knowledge that form the basis of understanding
-                                - episodic: Specific events, experiences, or temporal information
-                                - semantic: General knowledge, concepts, and relationships between ideas
-                                - procedural: Steps, methods, or processes for accomplishing tasks
-                                - emotional: Feelings, reactions, and affective experiences
-                                - contextual: Environmental, situational, or background information""",
-                                "enum": ["core", "episodic", "semantic", "procedural", "emotional", "contextual"]
-                            },
-                            "categories": {
-                                "type": "array",
-                                "items": {"type": "string"},
-                                "description": "List of categories that help organize and classify this memory. Use established categories when possible for consistency."
-                            },
-                            "description": {
-                                "type": "string", 
-                                "description": "A brief summary that captures the key points and significance of this memory. What makes it important to remember?"
-                            },
-                            "relationships": {
-                                "type": "array",
-                                "items": {"type": "string"},
-                                "description": """List of related memories in the format '#predicate [[object]]'. Common predicates include:
-                                - #partOf: This memory is a component of another concept
-                                - #relatesTo: General connection between memories
-                                - #follows: Temporal or logical sequence
-                                - #causes: Causal relationship
-                                - #contradicts: Conflicts with another memory
-                                - #supports: Provides evidence or backing
-                                - #examples: Specific instances or cases"""
-                            },
-                            "tags": {
-                                "type": "array",
-                                "items": {"type": "string"},
-                                "description": "List of keywords or tags that help with retrieval and association. Use specific, meaningful tags that aid in finding this memory later."
-                            }
-                        },
-                        "required": ["title", "content", "memory_type", "categories", "description"]
-                    }
-                ),
-                types.Tool(
-                    name="search_memories",
-                    description="Search through existing memories",
-                    inputSchema={
-                        "type": "object",
-                        "properties": {
-                            "query": {
-                                "type": "string",
-                                "description": "Search query"
-                            },
-                            "threshold": {
-                                "type": "number",
-                                "description": "Minimum relevance score (0-100)",
-                                "default": 60
-                            }
-                        },
-                        "required": ["query"]
-                    }
-                ),
-                types.Tool(
-                    name="strengthen_relationship",
-                    description="Strengthen a relationship between two memories",
-                    inputSchema={
-                        "type": "object",
-                        "properties": {
-                            "source": {"type": "string", "description": "Path to source memory"},
-                            "target": {"type": "string", "description": "Path to target memory"},
-                            "predicate": {"type": "string", "description": "Relationship type"}
-                        },
-                        "required": ["source", "target", "predicate"]
-                    }
+                    name=tool.name,
+                    description=tool.description,
+                    inputSchema=tool.input_schema
                 )
+                for tool in tools
             ]
 
         @self.server.call_tool()
-        async def handle_call_tool(name: str, arguments: Optional[Dict[str, Any]] = None) -> list[types.TextContent]:
+        async def handle_call_tool(name: str, arguments: Optional[Dict[str, Any]] = None) -> List[types.TextContent]:
             if not arguments:
                 raise ValueError("Arguments required")
-
-            try:
-                if name == "fuzzy_search":
-                    query = arguments.get("query")
-                    threshold = arguments.get("threshold", 60)
-                    return await self._perform_search(query, threshold)
-                
-                elif name == "create_note":
-                    title = arguments.get("title")
-                    content = arguments.get("content")
-                    folder = Path(arguments.get("folder")) if arguments.get("folder") else None
-                    
-                    note = await self.vault.create_note(
-                        path=folder / f"{title}.md" if folder else Path(f"{title}.md"),
-                        content=content
-                    )
-                    if note:
-                        return [types.TextContent(
-                            type="text",
-                            text=f"Created note: {note.path}\nContent preview:\n{note.content[:200]}..."
-                        )]
-                    return [types.TextContent(type="text", text="Failed to create note")]
-
-                elif name == "edit_note":
-                    print(f"Editing note with arguments: {arguments}", file=sys.stderr)
-                    
-                    title = arguments.get("title")
-                    if not title:
-                        return [types.TextContent(type="text", text="Title is required")]
-                    
-                    content = arguments.get("content", "")
-                    mode = arguments.get("mode", "append")
-                    heading = arguments.get("heading")
-
-                    # First try to find the note
-                    note_path = Path(f"{title}.md")
-                    print(f"Looking for note: {note_path}", file=sys.stderr)
-                    
-                    note = await self.vault.get_note(note_path)
-                    if not note:
-                        return [types.TextContent(type="text", text=f"Could not find note: {title}")]
-
-                    print(f"Found note, attempting update with mode: {mode}", file=sys.stderr)
-                    
-                    try:
-                        success = await self.vault.update_note(
-                            path=note.path,
-                            content=content,
-                            mode=mode,
-                            heading=heading
-                        )
-                        
-                        if not success:
-                            return [types.TextContent(type="text", text=f"Failed to update note: {title}")]
-                            
-                        # Get the updated note to show the changes
-                        updated_note = await self.vault.get_note(note.path)
-                        if not updated_note:
-                            return [types.TextContent(type="text", text="Note was updated but couldn't be reloaded")]
-                            
-                        preview = updated_note.content[:200] + "..." if len(updated_note.content) > 200 else updated_note.content
-                        return [types.TextContent(
-                            type="text",
-                            text=f"Successfully updated note: {title}\nPreview:\n{preview}"
-                        )]
-                        
-                    except Exception as e:
-                        print(f"Error updating note: {e}", file=sys.stderr)
-                        return [types.TextContent(type="text", text=f"Error updating note: {str(e)}")]
-                
-                elif name == "scrape_website":
-                    url = arguments.get("url")
-                    note_name = arguments.get("name")  # Get the provided name
-                    if not url or not note_name:
-                        return [types.TextContent(type="text", text="URL and name are required")]
-                    
-                    try:
-                        # Scrape the content
-                        result = await self.scraper.search_and_scrape(url)
-                        
-                        # Use the provided name for the filename
-                        sanitized_title = "".join(c for c in note_name if c.isalnum() or c in (' ', '-', '_')).strip()
-                        if not sanitized_title:
-                            sanitized_title = "scraped-content"
-                        
-                        # Create the note with updated metadata
-                        note = await self.vault.create_note(
-                            path=Path(f"{sanitized_title}.md"),
-                            content=result['content'],
-                            metadata={
-                                "url": result.get('final_url', url),
-                                "date_scraped": datetime.now().isoformat()
-                            }
-                        )
-                        
-                        if note:
-                            return [types.TextContent(
-                                type="text",
-                                text=f"Successfully scraped and created note: {note.path}\n\n"
-                                     f"Title: {result['title']}\n"
-                                     f"URL: {result['url']}\n\n"
-                                     f"Preview:\n{result['content'][:500]}..."
-                            )]
-                        return [types.TextContent(type="text", text="Failed to create note from scraped content")]
-                            
-                    except Exception as e:
-                        print(f"Error scraping website: {e}", file=sys.stderr)
-                        return [types.TextContent(type="text", text=f"Error scraping website: {str(e)}")]
-                
-                elif name == "create_memory":
-                    memory = await self.memory_manager.create_memory(
-                        title=arguments.get("title"),
-                        content=arguments.get("content"),
-                        memory_type=arguments.get("memory_type"),
-                        categories=arguments.get("categories", []),
-                        description=arguments.get("description"),
-                        relationships=arguments.get("relationships", []),
-                        tags=arguments.get("tags", [])
-                    )
-                    
-                    if memory:
-                        return [types.TextContent(
-                            type="text",
-                            text=f"Created memory: {memory['title']}\nPath: {memory['path']}\nMetadata: {memory['metadata']}"
-                        )]
-                    return [types.TextContent(type="text", text="Failed to create memory")]
-
-                elif name == "search_memories":
-                    query = arguments.get("query")
-                    threshold = arguments.get("threshold", 60)
-                    
-                    memories = await self.memory_manager.search_relevant_memories(query, threshold)
-                    
-                    if not memories:
-                        return [types.TextContent(type="text", text="No relevant memories found")]
-                        
-                    results = [f"Found {len(memories)} relevant memories:"]
-                    for memory in memories:
-                        results.append(
-                            f"\nTitle: {memory['title']}\n"
-                            f"Path: {memory['path']}\n"
-                            f"Preview: {memory['preview']}\n"
-                            f"{'='*50}"
-                        )
-                    
-                    return [types.TextContent(type="text", text="\n".join(results))]
-
-                elif name == "strengthen_relationship":
-                    success = await self.memory_manager.strengthen_relationship(
-                        source_path=Path(arguments.get("source")),
-                        target_path=Path(arguments.get("target")),
-                        predicate=arguments.get("predicate")
-                    )
-                    
-                    return [types.TextContent(
-                        type="text",
-                        text="Successfully strengthened relationship" if success else "Failed to strengthen relationship"
-                    )]
-
-                else:
-                    raise ValueError(f"Unknown tool: {name}")
-
-            except Exception as e:
-                print(f"Tool error: {str(e)}", file=sys.stderr)
-                return [types.TextContent(type="text", text=f"Error: {str(e)}")]
-
-    async def _perform_search(self, query: str, threshold: int) -> list[types.TextContent]:
-        print(f"Performing search with query: {query} (threshold: {threshold})", file=sys.stderr)  # Added debug log
-        results = []
-        
-        # Cache key includes query and threshold
-        cache_key = f"{query}:{threshold}"
-        
-        async with self._cache_lock:
-            if cache_key in self._search_cache:
-                cache_time, results = self._search_cache[cache_key]
-                if time.time() - cache_time < 300:  # 5 minute cache
-                    return results
-
-        try:
-            notes = await self.vault.get_all_notes()
             
-            # Process in parallel using asyncio.gather
-            async def process_note(note):
-                ratio = fuzz.partial_ratio(query.lower(), note.title.lower())
-                if ratio >= threshold:
-                    return types.TextContent(
+            try:
+                tool = next((t for t in tools if t.name == name), None)
+                if not tool:
+                    error_msg = f"Unknown tool: {name}"
+                    print(f"[Server] {error_msg}", file=sys.stderr)
+                    return [types.TextContent(type="text", text=error_msg)]
+                
+                print(f"[Server] Executing tool: {name}", file=sys.stderr)
+                results = await tool.handler(arguments, dependencies)
+                if not results:
+                    error_msg = f"Tool {name} returned no results"
+                    print(f"[Server] {error_msg}", file=sys.stderr)
+                    return [types.TextContent(type="text", text=error_msg)]
+                    
+                return results
+            
+            except Exception as e:
+                error_msg = f"Error executing {name}: {str(e)}"
+                print(f"[Server] {error_msg}", file=sys.stderr)
+                return [types.TextContent(type="text", text=error_msg)]
+
+    async def _perform_search(self, query: str, threshold: int) -> List[types.TextContent]:
+        """Perform a fuzzy search using the indexed SearchEngine."""
+        print(f"Performing search with query: {query} (threshold: {threshold})", file=sys.stderr)
+        
+        try:
+            search_results = await self.search_engine.search(
+                query, 
+                threshold=threshold,
+                max_results=10,
+                search_contents=True
+            )
+            
+            if not search_results:
+                return [types.TextContent(type="text", text="No matches found.")]
+            
+            results = []
+            for res in search_results:
+                results.append(
+                    types.TextContent(
                         type="text",
-                        text=f"File: {note.path}\n"
-                             f"Match Score: {ratio}\n"
-                             f"Content:\n{note.content}\n"
+                        text=f"File: {res.file_path}\n"
+                             f"Match Score: {res.score}\n"
+                             f"Content:\n{res.preview}\n"
                              f"{'='*50}\n"
                     )
-                return None
-
-            results = await asyncio.gather(*[process_note(note) for note in notes])
-            results = [r for r in results if r is not None]
-            results = results[:10] if results else [types.TextContent(type="text", text="No matches found")]
-            
-            # Cache results
-            async with self._cache_lock:
-                self._search_cache[cache_key] = (time.time(), results)
-            
+                )
             return results
+            
         except Exception as e:
             print(f"Search error: {str(e)}", file=sys.stderr)
             return [types.TextContent(type="text", text=f"Error during search: {str(e)}")]
@@ -463,6 +212,7 @@ class ClaudesidianServer:
     async def run(self) -> None:
         """
         Start the MCP server using stdio transport.
+        Adjusted to work without MoC and sessions.
         """
         if not self._initialized:
             await self.setup()
@@ -476,6 +226,15 @@ class ClaudesidianServer:
                     notification_options=NotificationOptions(),
                     experimental_capabilities={}
                 )
+                # Prepare shared dependencies
+                dependencies = {
+                    "vault": self.vault,
+                    "memory_manager": self.memory_manager,
+                    "reasoning_manager": self.reasoning_manager,
+                    "scraper": self.scraper,
+                }
+                # Register tools with dependencies
+                self._setup_tools(dependencies)
                 await self.server.run(
                     read_stream,
                     write_stream,
@@ -493,30 +252,73 @@ class ClaudesidianServer:
             await self.scraper.cleanup()  # Ensure scraper cleanup
             await self.vault.cleanup()  # Clean up all resources
 
+def resolve_vault_path(path_str: str) -> Path:
+    """Resolve and validate the vault path."""
+    try:
+        # Expand user home directory and environment variables
+        expanded_path = os.path.expandvars(os.path.expanduser(path_str))
+        path = Path(expanded_path).resolve()
+        
+        if not path.exists():
+            print(f"Error: Vault path does not exist: {path}", file=sys.stderr)
+            sys.exit(1)
+        if not path.is_dir():
+            print(f"Error: Vault path is not a directory: {path}", file=sys.stderr)
+            sys.exit(1)
+            
+        return path
+    except Exception as e:
+        print(f"Error resolving vault path: {e}", file=sys.stderr)
+        sys.exit(1)
+
+def get_version():
+    """Get the package version."""
+    try:
+        from importlib.metadata import version
+        return version("claudesidian")
+    except Exception:
+        return "unknown"
+
 def main() -> None:
     """
     Main entry point for the server.
     Handles command line arguments and starts the server.
     """
-    print("Starting claudesidian MCP server...", file=sys.stderr)  # Added debug log
-    
-    if len(sys.argv) != 2:
-        print("Usage: claudesidian <vault-path>", file=sys.stderr)  # Changed from claudesidian-mcp
+    parser = argparse.ArgumentParser(description="Claudesidian MCP server for Obsidian vault interaction")
+    parser.add_argument('vault_path', nargs='?', help='Path to Obsidian vault')
+    parser.add_argument('--version', action='store_true', help='Show version number and exit')
+    args = parser.parse_args()
+
+    if args.version:
+        print(f"Claudesidian version {get_version()}")
+        sys.exit(0)
+
+    if not args.vault_path:
+        parser.print_help()
         sys.exit(1)
 
-    vault_path = Path(os.path.expanduser(sys.argv[1]))
-    print(f"Using vault path: {vault_path}", file=sys.stderr)  # Added debug log
+    print(f"Starting Claudesidian v{get_version()}...", file=sys.stderr)
     
-    if not vault_path.is_dir():
-        print(f"Error: {vault_path} is not a directory", file=sys.stderr)
-        sys.exit(1)
+    vault_path = resolve_vault_path(args.vault_path)
+    print(f"Using vault path: {vault_path}", file=sys.stderr)
 
     async def run_server():
         server = ClaudesidianServer(vault_path)
-        await server.setup()  # Initialize async components
-        await server.run()
+        try:
+            await server.setup()
+            await server.run()
+        except Exception as e:
+            print(f"Server error: {e}", file=sys.stderr)
+            sys.exit(1)
 
-    asyncio.run(run_server())
+    try:
+        asyncio.run(run_server())
+    except KeyboardInterrupt:
+        print("\nShutting down...", file=sys.stderr)
+        sys.exit(0)
+    except Exception as e:
+        print(f"Fatal error: {e}", file=sys.stderr)
+        sys.exit(1)
 
 if __name__ == "__main__":
     main()

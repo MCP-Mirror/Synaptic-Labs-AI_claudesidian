@@ -1,3 +1,4 @@
+# src/claudesidian_mcp/__init__.py
 """
 Claudesidian MCP - An Obsidian vault interface for Claude
 """
