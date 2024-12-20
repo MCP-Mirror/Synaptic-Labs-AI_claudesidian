@@ -48,13 +48,19 @@ Before setting up the server, ensure you have the following installed on your sy
 
 3. **Install Dependencies**
 
-   ```bash
+Open up your terminal and run the following two commands.
+
+   ```python
    pip install -e .
    ```
 
-4. **Run the Server**
+   ```python
+   playwright install
+   ```
 
-   ```bash
+5. **Run the Server**
+
+   ```python
    claudesidian "PATH_TO_YOUR_OBSIDIAN_VAULT"
    ```
 
