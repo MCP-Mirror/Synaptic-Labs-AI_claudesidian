@@ -67,9 +67,41 @@ class VaultManager:
         self._link_pattern = re.compile(r'\[\[(.*?)\]\]')
         self._tag_pattern = re.compile(r'#([a-zA-Z0-9_-]+)')
         self._yaml_pattern = re.compile(r'^---\n(.*?)\n---', re.DOTALL)
+        self._raw_tag_pattern = re.compile(r'[^a-zA-Z0-9]+')  # New pattern for normalization
 
         self._folder_cache = {}
         print(f"VaultManager initialized with path: {vault_path}", file=sys.stderr)
+
+    def normalize_tag(self, tag: str) -> str:
+        """
+        Convert any string into a valid snake_case tag.
+        Examples:
+            'winnie the pooh' -> 'winnie_the_pooh'
+            'AI/ML tools' -> 'ai_ml_tools'
+            'C++' -> 'cpp'
+        """
+        # Remove leading/trailing spaces and convert to lowercase
+        tag = tag.strip().lower()
+        
+        # Special case replacements
+        replacements = {
+            'c++': 'cpp',
+            'c#': 'csharp',
+            '.net': 'dotnet'
+            # Add more special cases as needed
+        }
+        if tag in replacements:
+            return replacements[tag]
+            
+        # Replace non-alphanumeric characters with spaces, then split
+        words = self._raw_tag_pattern.sub(' ', tag).split()
+        
+        # Join with underscores
+        return '_'.join(word for word in words if word)
+
+    def normalize_tags(self, tags: List[str]) -> List[str]:
+        """Normalize a list of tags to snake_case format."""
+        return [self.normalize_tag(tag) for tag in tags if tag]
 
     async def ensure_folder(self, path: Path) -> bool:
         """

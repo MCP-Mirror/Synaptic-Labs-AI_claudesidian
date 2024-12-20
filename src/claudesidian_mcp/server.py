@@ -87,7 +87,8 @@ class ClaudesidianServer:
         folders = {
             "memory": claudesidian_folder / "memory",
             "reasoning": claudesidian_folder / "reasoning",
-            "websites": claudesidian_folder / "websites"
+            "websites": claudesidian_folder / "websites",
+            "relationships": claudesidian_folder / "relationships"  # Add relationships folder
         }
         
         for folder_path in folders.values():
@@ -103,6 +104,8 @@ class ClaudesidianServer:
 ## Reasoning
 
 ## Websites
+
+## Relationships
 """
             index_path.write_text(index_content, encoding='utf-8')
 

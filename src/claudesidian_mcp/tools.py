@@ -422,7 +422,7 @@ class CreateMemoryTool(Tool):
             categories = arguments.get("categories", [])
             description = arguments.get("description")
             relationships = arguments.get("relationships", [])
-            tags = arguments.get("tags", [])
+            tags = self.vault.normalize_tags(arguments.get("tags", []))  # Normalize tags
 
             result = await self.memory_manager.create_memory(
                 title=title,
@@ -431,7 +431,7 @@ class CreateMemoryTool(Tool):
                 categories=categories,
                 description=description,
                 relationships=relationships,
-                tags=tags
+                tags=tags  # Use normalized tags
             )
 
             if result:
@@ -584,8 +584,32 @@ class CreateNoteTool(Tool):
     }
 
     async def execute(self, arguments: Dict[str, Any]) -> List[str]:
-        # Implementation using VaultManager
-        pass
+        """Create a new note in the vault."""
+        try:
+            title = arguments.get("title")
+            content = arguments.get("content")
+            folder = arguments.get("folder", "")
+            
+            # Construct the path
+            if folder:
+                note_path = Path(folder) / f"{title}.md"
+            else:
+                note_path = Path(f"{title}.md")
+            
+            # Create the note
+            note = await self.vault.create_note(
+                path=note_path,
+                content=content
+            )
+            
+            if not note:
+                return ["Failed to create note"]
+                
+            return [f"Successfully created note at: {note_path}"]
+            
+        except Exception as e:
+            print(f"[CreateNoteTool] Error: {e}", file=sys.stderr)
+            return [f"Error creating note: {str(e)}"]
 
 class EditNoteTool(Tool):
     """Tool for editing existing notes."""
@@ -618,6 +642,281 @@ class EditNoteTool(Tool):
         # Implementation using VaultManager
         pass
 
+class MemoryRetrievalTool(Tool):
+    """Tool for intelligent memory retrieval and synthesis from the vault."""
+    
+    name = "retrieve_memories"
+    description = """
+    Retrieve and analyze memories from the vault by:
+    1. First reading the index file
+    2. Identifying relevant notes based on your query
+    3. Reading and synthesizing the content of those notes
+    Use this tool when you need to access and understand existing knowledge.
+    """
+
+    input_schema = {
+        "type": "object",
+        "properties": {
+            "query": {
+                "type": "string",
+                "description": "What kind of information you're looking for"
+            },
+            "sections": {
+                "type": "array",
+                "items": {
+                    "type": "string",
+                    "enum": ["Memories", "Reasoning", "Websites"],
+                    "description": "Which sections of the index to search"
+                },
+                "description": "Which sections of the index to include in search"
+            },
+            "max_notes": {
+                "type": "integer",
+                "description": "Maximum number of notes to retrieve",
+                "default": 5
+            }
+        },
+        "required": ["query", "sections"]
+    }
+
+    async def execute(self, arguments: Dict[str, Any]) -> List[str]:
+        try:
+            query = arguments.get("query")
+            sections = arguments.get("sections", ["Memories", "Reasoning", "Websites"])
+            max_notes = arguments.get("max_notes", 5)
+
+            # Step 1: Read the index file
+            index_path = Path("claudesidian/index.md")
+            index_note = await self.vault.get_note(index_path)
+            if not index_note:
+                return ["Error: Could not read index file"]
+
+            # Step 2: Parse index and find relevant note links
+            relevant_links = await self._parse_index_for_links(index_note.content, sections, query)
+            if not relevant_links:
+                return ["No relevant notes found in index"]
+
+            # Step 3: Read and synthesize content from linked notes
+            synthesis = await self._synthesize_notes(relevant_links[:max_notes])
+            
+            return [synthesis]
+
+        except Exception as e:
+            print(f"[MemoryRetrievalTool] Error: {e}", file=sys.stderr)
+            return [f"Error retrieving memories: {str(e)}"]
+
+    async def _parse_index_for_links(self, content: str, sections: List[str], query: str) -> List[str]:
+        """Parse the index file content and find relevant note links."""
+        links = []
+        current_section = None
+        
+        for line in content.split('\n'):
+            # Check for section headers
+            if line.startswith('##'):
+                current_section = line.lstrip('#').strip()
+                continue
+                
+            # If we're in a relevant section, look for links
+            if current_section in sections:
+                # Find [[note]] style links
+                matches = re.findall(r'\[\[(.*?)\]\]', line)
+                links.extend(matches)
+
+        # If we have a search engine in dependencies, use it to filter relevant links
+        search_engine = self.dependencies.get("search_engine")
+        if search_engine:
+            results = await search_engine.search(query, threshold=60)
+            filtered_links = []
+            for link in links:
+                for result in results:
+                    if result['title'].lower() in link.lower():
+                        filtered_links.append(link)
+                        break
+            return filtered_links
+
+        return links
+
+    async def _synthesize_notes(self, note_titles: List[str]) -> str:
+        """Read and synthesize content from multiple notes."""
+        notes_content = []
+        
+        for title in note_titles:
+            # Convert title to path - assuming .md extension and basic path structure
+            note_path = Path(f"claudesidian/{title}.md")
+            note = await self.vault.get_note(note_path)
+            
+            if note:
+                notes_content.append(f"=== {title} ===\n{note.content}\n")
+
+        if not notes_content:
+            return "No note contents could be retrieved."
+
+        synthesis = "\n".join([
+            "# Memory Synthesis",
+            f"Retrieved {len(notes_content)} notes:",
+            "",
+            *notes_content
+        ])
+
+        return synthesis
+
+class RelationshipsTool(Tool):
+    """Tool for managing relationship information and connections."""
+    
+    name = "relationship"
+    description = "Create or update information about relationships with people."
+
+    input_schema = {
+        "type": "object",
+        "properties": {
+            "name": {
+                "type": "string",
+                "description": "Full name of the person"
+            },
+            "type": {
+                "type": "string",
+                "enum": ["professional", "personal", "family", "acquaintance", "other"],
+                "description": "Type of relationship"
+            },
+            "title": {
+                "type": "string",
+                "description": "Professional title or role (if applicable)"
+            },
+            "organization": {
+                "type": "string",
+                "description": "Associated organization (if applicable)"
+            },
+            "description": {
+                "type": "string",
+                "description": "Brief description of the relationship and relevant context"
+            },
+            "connections": {
+                "type": "array",
+                "items": {
+                    "type": "string",
+                    "description": "Links to other people in the format [[Person Name]]"
+                },
+                "description": "Known connections to other people"
+            },
+            "contact": {
+                "type": "object",
+                "properties": {
+                    "email": {
+                        "type": "string",
+                        "description": "Email address"
+                    },
+                    "phone": {
+                        "type": "string",
+                        "description": "Phone number"
+                    },
+                    "social": {
+                        "type": "object",
+                        "description": "Social media profiles",
+                        "additionalProperties": True
+                    }
+                }
+            },
+            "tags": {
+                "type": "array",
+                "items": {
+                    "type": "string"
+                },
+                "description": "Tags for categorizing and finding relationships"
+            },
+            "notes": {
+                "type": "string",
+                "description": "Additional notes or important details"
+            },
+            "last_interaction": {
+                "type": "string",
+                "description": "Date and brief note about last interaction"
+            }
+        },
+        "required": ["name", "type", "description"]
+    }
+
+    async def execute(self, arguments: Dict[str, Any]) -> List[str]:
+        """Create or update a relationship entry."""
+        try:
+            name = arguments.get("name")
+            safe_name = name.replace(" ", "_")
+            
+            # Create metadata and content
+            metadata = {
+                "type": arguments.get("type"),
+                "title": arguments.get("title"),
+                "organization": arguments.get("organization"),
+                "tags": self.vault.normalize_tags(arguments.get("tags", [])),  # Normalize tags
+                "last_updated": datetime.now().isoformat(),
+                "last_interaction": arguments.get("last_interaction")
+            }
+            
+            content = f"""# {name}
+
+## Description
+{arguments.get("description")}
+
+"""
+            if arguments.get("title") or arguments.get("organization"):
+                content += "## Professional Information\n"
+                if arguments.get("title"):
+                    content += f"**Title:** {arguments['title']}\n"
+                if arguments.get("organization"):
+                    content += f"**Organization:** {arguments['organization']}\n"
+                content += "\n"
+
+            if arguments.get("connections"):
+                content += "## Connections\n"
+                for connection in arguments["connections"]:
+                    content += f"- {connection}\n"
+                content += "\n"
+
+            if arguments.get("contact"):
+                content += "## Contact Information\n"
+                contact = arguments["contact"]
+                if contact.get("email"):
+                    content += f"- Email: {contact['email']}\n"
+                if contact.get("phone"):
+                    content += f"- Phone: {contact['phone']}\n"
+                if contact.get("social"):
+                    content += "### Social Media\n"
+                    for platform, handle in contact["social"].items():
+                        content += f"- {platform}: {handle}\n"
+                content += "\n"
+
+            if arguments.get("notes"):
+                content += f"## Notes\n{arguments['notes']}\n"
+
+            # Save the note
+            note_path = Path(f"claudesidian/relationships/{safe_name}.md")
+            note = await self.vault.create_note(
+                path=note_path,
+                content=content,
+                metadata=metadata
+            )
+
+            if not note:
+                return ["Failed to create relationship note"]
+
+            # Update index with a description line
+            index_path = Path("claudesidian/index.md")
+            index_content = f"- [[{safe_name}]] - {arguments['description']}\n"
+            await self.vault.update_note(
+                path=index_path,
+                content=index_content,
+                mode="append",
+                heading="Relationships"
+            )
+
+            return [
+                f"Successfully created relationship entry for {name}\n"
+                f"Saved to: {note_path}"
+            ]
+
+        except Exception as e:
+            print(f"[RelationshipsTool] Error: {e}", file=sys.stderr)
+            return [f"Error creating relationship entry: {str(e)}"]
+
 def create_tools_registry(vault: VaultManager, memory_manager: MemoryManager, reasoning_manager: ReasoningManager) -> List[Tool]:
     """Create instances of all available tools."""
     return [
@@ -626,7 +925,7 @@ def create_tools_registry(vault: VaultManager, memory_manager: MemoryManager, re
         FuzzySearchTool(vault, memory_manager, reasoning_manager), 
         ScrapeWebsiteTool(vault, memory_manager, reasoning_manager),
         CreateNoteTool(vault, memory_manager, reasoning_manager),
-        EditNoteTool(vault, memory_manager, reasoning_manager)
+        EditNoteTool(vault, memory_manager, reasoning_manager),
+        MemoryRetrievalTool(vault, memory_manager, reasoning_manager),
+        RelationshipsTool(vault, memory_manager, reasoning_manager)  # Add new tool
     ]
-
-# ...rest of the file...
